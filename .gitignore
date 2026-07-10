@@ -1,0 +1,7 @@
+# Runtime artifacts
+*.db
+*.log
+*.log.*
+__pycache__/
+*.pyc
+.env
