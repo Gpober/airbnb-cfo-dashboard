@@ -455,13 +455,28 @@ class KalshiClient:
 
     # -- authenticated endpoints ----------------------------------------- #
 
-    def get_fills(self, ticker: Optional[str] = None, limit: int = 200) -> list:
-        params = {"limit": limit}
-        if ticker:
-            params["ticker"] = ticker
-        query = "&".join(f"{k}={v}" for k, v in params.items())
-        data = self._request("GET", f"/portfolio/fills?{query}", signed=True)
-        return data.get("fills", [])
+    def get_fills(self, ticker: Optional[str] = None, limit: int = 200,
+                  max_pages: int = 20) -> list:
+        """Return all fills (optionally for one ticker), following the cursor.
+
+        Reconciliation must not miss fills, so we page through the whole result
+        set rather than trusting a single response.
+        """
+        fills: list = []
+        cursor: Optional[str] = None
+        for _ in range(max_pages):
+            params = {"limit": limit}
+            if ticker:
+                params["ticker"] = ticker
+            if cursor:
+                params["cursor"] = cursor
+            query = "&".join(f"{k}={v}" for k, v in params.items())
+            data = self._request("GET", f"/portfolio/fills?{query}", signed=True)
+            fills.extend(data.get("fills", []))
+            cursor = data.get("cursor")
+            if not cursor:
+                break
+        return fills
 
     def get_positions(self, ticker: Optional[str] = None) -> list:
         path = "/portfolio/positions"
@@ -795,6 +810,11 @@ class WebSocketFeed:
         self._thread = None
         self._stop = False
         self._last_msg_ts = 0.0
+        # orderbook_delta carries a monotonic sequence number per market. A gap
+        # means we missed a delta and the local book is unreliable until the
+        # next snapshot -- we flag it and let callers fall back to REST.
+        self._seq: Optional[int] = None
+        self._desynced = False
 
     # -- message handling (pure; unit-testable without a socket) ---------- #
 
@@ -802,9 +822,19 @@ class WebSocketFeed:
         ob = msg.get("msg", {})
         self._yes = {int(p): int(s) for p, s in (ob.get("yes") or [])}
         self._no = {int(p): int(s) for p, s in (ob.get("no") or [])}
+        # A fresh snapshot resets the sequence and clears any prior desync.
+        self._seq = msg.get("seq")
+        self._desynced = False
         self._recompute_top()
 
     def _apply_delta(self, msg: dict) -> None:
+        seq = msg.get("seq")
+        if self._seq is not None and seq is not None and seq != self._seq + 1:
+            self._desynced = True
+            log_kv(self.log, logging.WARNING, "ws sequence gap; REST fallback",
+                   expected=self._seq + 1, got=seq)
+        if seq is not None:
+            self._seq = seq
         d = msg.get("msg", {})
         side = d.get("side")
         price = d.get("price")
@@ -877,7 +907,7 @@ class WebSocketFeed:
                 "cmd": "subscribe",
                 "params": {
                     "channels": ["ticker", "orderbook_delta"],
-                    "market_ticker": self.ticker,
+                    "market_tickers": [self.ticker],  # Kalshi WS v2 expects a list
                 },
             }
             ws.send(json.dumps(sub))
@@ -911,7 +941,8 @@ class WebSocketFeed:
         return self.connected
 
     def is_fresh(self, max_age: float = 10.0) -> bool:
-        return self.connected and self.top.valid and (time.time() - self.top.ts) < max_age
+        return (self.connected and self.top.valid and not self._desynced
+                and (time.time() - self.top.ts) < max_age)
 
     def stop(self) -> None:
         self._stop = True
@@ -973,54 +1004,99 @@ def reconcile_position_from_fills(client: KalshiClient, ticker: str,
 
 def run_manage(cfg: Config, client: KalshiClient, signer: KalshiSigner,
                logger: logging.Logger, cycles: Optional[int] = None) -> None:
-    """Manage an open position using the WebSocket feed, falling back to REST.
+    """Manage a position from the WebSocket feed, falling back to REST.
 
-    This loop reconciles the real position from fills, then watches the market
-    for exit conditions. Orders are dry-run unless ``cfg.live_orders_enabled``.
+    In LIVE mode the real position is the source of truth: it is reconciled
+    from ``GET /portfolio/fills`` every cycle, and after any order we suppress
+    further order placement for a short grace window so a resting limit is not
+    duplicated before it fills.
+
+    In DRY_RUN / demo mode no order actually reaches the exchange, so the loop
+    simulates the fill locally -- this lets you watch a full entry -> exit
+    lifecycle without touching the API's order endpoint.
     """
+    live = cfg.live_orders_enabled
     ticker = resolve_active_ticker(client, cfg.series_ticker, logger)
     if ticker is None:
         return
 
-    pos = reconcile_position_from_fills(client, ticker, logger)
+    # Seed the position from real fills when we can read them (signed).
+    pos: Optional[Position] = None
+    if signer.ready:
+        try:
+            pos = reconcile_position_from_fills(client, ticker, logger)
+        except Exception as exc:
+            log_kv(logger, logging.WARNING, "startup reconcile failed", error=str(exc))
+
     feed = WebSocketFeed(cfg, signer, ticker, logger)
     ws_ok = feed.start() if signer.ready else False
     if not ws_ok:
         log_kv(logger, logging.INFO, "using REST polling for management")
 
+    grace = max(2 * cfg.poll_interval_sec, 5.0)
+    pending_until = 0.0  # do not place another order before this time (live only)
     i = 0
     try:
         while cycles is None or i < cycles:
             i += 1
+
+            # --- market data: prefer a fresh socket, else REST ------------- #
             if ws_ok and feed.is_fresh():
-                top = feed.top
-                source = "ws"
+                top, source = feed.top, "ws"
             else:
                 if ws_ok and not feed.is_fresh():
                     log_kv(logger, logging.WARNING, "ws stale; REST fallback this cycle")
                 try:
                     top = client.get_top(ticker)
+                    source = "rest"
                 except Exception as exc:
                     log_kv(logger, logging.WARNING, "REST top failed", error=str(exc))
                     time.sleep(cfg.poll_interval_sec)
                     continue
-                source = "rest"
+
+            # --- position truth: live reads fills every cycle -------------- #
+            if live and signer.ready:
+                try:
+                    pos = reconcile_position_from_fills(client, ticker, logger)
+                except Exception as exc:
+                    log_kv(logger, logging.WARNING, "reconcile failed", error=str(exc))
+
+            now = time.time()
+            placed = False
 
             if pos is None:
-                if decide_entry(top, cfg):
+                if now >= pending_until and top.valid and decide_entry(top, cfg):
                     qty = contracts_for_notional(top.yes_ask, cfg.target_notional_usd)
                     if qty > 0:
+                        log_kv(logger, logging.INFO, "entry signal",
+                               price=top.yes_ask, qty=qty, source=source)
                         client.place_order(ticker, "yes", "buy", qty, top.yes_ask)
-                        # Re-reconcile from fills rather than assuming the fill.
-                        pos = reconcile_position_from_fills(client, ticker, logger)
+                        placed = True
+                        if not live:
+                            # Simulate the fill so the lifecycle is observable.
+                            fee = kalshi_fee_cents(qty, top.yes_ask, cfg)
+                            pos = Position(ticker=ticker, contracts=qty,
+                                           entry_price_cents=top.yes_ask,
+                                           entry_fee_cents=fee, opened_ts=now, remaining=qty)
             else:
                 decision = decide_exit(pos, top, cfg)
-                if decision:
+                if decision and now >= pending_until:
                     reason, sell_price, qty = decision
                     log_kv(logger, logging.INFO, "exit signal",
                            reason=reason, price=sell_price, qty=qty, source=source)
                     client.place_order(ticker, "yes", "sell", qty, sell_price)
-                    pos = reconcile_position_from_fills(client, ticker, logger)
+                    placed = True
+                    if not live:
+                        pos.remaining -= qty
+                        if reason == "scale_out":
+                            pos.scaled_out = True
+                        if pos.remaining <= 0:
+                            pos = None
+
+            # After a live order, hold off until the grace window passes so a
+            # resting limit is not resubmitted before the next fills read.
+            if placed and live:
+                pending_until = now + grace
 
             time.sleep(cfg.poll_interval_sec)
     finally:

@@ -124,6 +124,54 @@ def _test_ws_parsing(chk, cfg):
     chk.ok("ws malformed ignored", True)
 
 
+def _test_ws_desync(chk, cfg):
+    feed = bot.WebSocketFeed(cfg, bot.KalshiSigner(cfg), "T", logging.getLogger("t"))
+    feed.connected = True  # simulate an open socket so is_fresh() is meaningful
+    feed.handle_message('{"type":"orderbook_snapshot","seq":5,"msg":{"yes":[[86,10]],"no":[[11,5]]}}')
+    chk.ok("not desynced after snapshot", not feed._desynced)
+    chk.ok("fresh after snapshot", feed.is_fresh())
+    feed.handle_message('{"type":"orderbook_delta","seq":6,"msg":{"side":"no","price":12,"delta":1}}')
+    chk.ok("in-order delta stays synced", not feed._desynced)
+    feed.handle_message('{"type":"orderbook_delta","seq":8,"msg":{"side":"no","price":13,"delta":1}}')
+    chk.ok("sequence gap flags desync", feed._desynced)
+    chk.ok("desync forces REST (not fresh)", not feed.is_fresh())
+    feed.handle_message('{"type":"orderbook_snapshot","seq":9,"msg":{"yes":[[86,10]],"no":[[11,5]]}}')
+    chk.ok("snapshot clears desync", not feed._desynced and feed.is_fresh())
+
+
+def _test_manage_dryrun(chk):
+    """run_manage in dry-run must simulate a full entry->exit and not spam orders."""
+    cfg = bot.Config()  # DEMO + DRY_RUN defaults -> live orders disabled
+    cfg.poll_interval_sec = 0.0
+    orders = []
+    books = [
+        bot.TopOfBook(yes_bid=86, yes_ask=87),   # entry
+        bot.TopOfBook(yes_bid=92, yes_ask=94),   # hold (no exit)
+        bot.TopOfBook(yes_bid=99, yes_ask=100),  # take-profit
+    ]
+    state = {"i": 0}
+
+    class _Stub:
+        def get_markets(self, **kw):
+            return {"markets": [{"ticker": "KXBTCD-T", "close_time": "2026-07-10T20:00:00Z"}]}
+
+        def get_top(self, ticker):
+            b = books[min(state["i"], len(books) - 1)]
+            state["i"] += 1
+            return b
+
+        def place_order(self, ticker, side, action, count, price_cents, order_type="limit"):
+            orders.append((action, count, price_cents))
+            return {"dry_run": True}
+
+    signer = bot.KalshiSigner(cfg)  # no creds -> not ready (WS skipped, REST used)
+    bot.run_manage(cfg, _Stub(), signer, logging.getLogger("t"), cycles=3)
+    actions = [o[0] for o in orders]
+    chk.ok("manage placed a buy", "buy" in actions)
+    chk.ok("manage placed a sell", "sell" in actions)
+    chk.eq("manage did not spam (exactly 2 orders)", len(orders), 2)
+
+
 def _test_reconcile(chk, cfg):
     class _StubClient:
         def get_fills(self, ticker=None, limit=200):
@@ -230,6 +278,8 @@ def run_selftests(cfg=None, logger=None) -> int:
     _test_decisions(chk, cfg)
     _test_orderbook(chk)
     _test_ws_parsing(chk, cfg)
+    _test_ws_desync(chk, cfg)
+    _test_manage_dryrun(chk)
     _test_reconcile(chk, cfg)
     _test_paper_harness(chk, cfg)
     _test_signing(chk)
