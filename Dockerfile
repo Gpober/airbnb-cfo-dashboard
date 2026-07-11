@@ -11,7 +11,7 @@ ENV PYTHONUNBUFFERED=1
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY kalshi_btc_hourly_bot.py kalshi_selftest.py ai_strategy.py ./
+COPY kalshi_btc_hourly_bot.py kalshi_selftest.py ai_strategy.py performance_memory.py ./
 
 # Build-time sanity check: offline self-tests must pass in the image.
 RUN python kalshi_btc_hourly_bot.py --selftest

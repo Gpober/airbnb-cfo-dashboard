@@ -63,6 +63,7 @@ from typing import Callable, Optional
 import requests
 
 from ai_strategy import AIStrategy, ai_early_exit, gate_entry  # optional AI layer
+from performance_memory import PerformanceMemory  # optional learning layer
 
 try:  # cryptography is required for real auth; keep import errors friendly.
     from cryptography.hazmat.primitives import hashes, serialization
@@ -185,6 +186,31 @@ class Config:
     ai_model: str = field(default_factory=lambda: os.getenv("KALSHI_AI_MODEL", "claude-opus-4-8"))
     ai_min_interval_sec: float = field(
         default_factory=lambda: _env_float("KALSHI_AI_MIN_INTERVAL_SEC", 30.0)
+    )
+
+    # --- Performance learning (optional; OFF by default) ------------------ #
+    # Reads the bot's own closed-trade history from Supabase and adapts. Like
+    # the AI layer, it can ONLY make the strategy more conservative: shrink
+    # size, skip a losing entry-price bucket, or pause after a losing streak.
+    # It never sizes up or loosens a limit. Needs the Supabase sink configured.
+    learn_enabled: bool = field(default_factory=lambda: _env_bool("KALSHI_LEARN_ENABLED", False))
+    learn_min_trades: int = field(default_factory=lambda: _env_int("KALSHI_LEARN_MIN_TRADES", 20))
+    learn_lookback: int = field(default_factory=lambda: _env_int("KALSHI_LEARN_LOOKBACK", 200))
+    learn_refresh_sec: float = field(
+        default_factory=lambda: _env_float("KALSHI_LEARN_REFRESH_SEC", 300.0)
+    )
+    # Floor on the size multiplier: learning may cut size to this fraction of
+    # base, never below (0.5 => at most a 50% cut).
+    learn_min_scalar: float = field(
+        default_factory=lambda: _env_float("KALSHI_LEARN_MIN_SCALAR", 0.5)
+    )
+    # Consecutive losing trades that pause new entries (existing exits still run).
+    learn_pause_loss_streak: int = field(
+        default_factory=lambda: _env_int("KALSHI_LEARN_PAUSE_LOSS_STREAK", 5)
+    )
+    # Min trades in an entry-price bucket before its (bad) stats can veto it.
+    learn_bucket_min_trades: int = field(
+        default_factory=lambda: _env_int("KALSHI_LEARN_BUCKET_MIN_TRADES", 8)
     )
 
     # --- Supabase sink (optional) ----------------------------------------- #
@@ -828,8 +854,14 @@ def decide_exit(pos: Position, top: TopOfBook, cfg: Config) -> Optional[tuple]:
 
 
 def ai_snapshot(cfg: Config, ticker: str, top: TopOfBook,
-                pos: Optional["Position"] = None, phase: str = "entry") -> dict:
-    """Compact market/position snapshot handed to the AI decision layer."""
+                pos: Optional["Position"] = None, phase: str = "entry",
+                history: Optional[dict] = None) -> dict:
+    """Compact market/position snapshot handed to the AI decision layer.
+
+    ``history`` (when the learning layer is on) is the bot's own realized
+    performance so the AI can weigh how entries like this one have actually
+    paid off, not just reason from theory.
+    """
     snap = {
         "ticker": ticker, "phase": phase,
         "yes_bid": top.yes_bid, "yes_ask": top.yes_ask,
@@ -839,6 +871,8 @@ def ai_snapshot(cfg: Config, ticker: str, top: TopOfBook,
         "stop_loss_cents": cfg.stop_loss_cents,
         "fee_at_ask_cents": kalshi_fee_cents(1, top.yes_ask, cfg) if top.yes_ask else None,
     }
+    if history:
+        snap["performance_history"] = history
     if pos is not None:
         unreal = ((top.yes_bid - pos.entry_price_cents) * pos.remaining
                   if top.yes_bid is not None else None)
@@ -1417,7 +1451,8 @@ def reconcile_position_from_fills(client: KalshiClient, ticker: str,
 def run_manage(cfg: Config, client: KalshiClient, signer: KalshiSigner,
                logger: logging.Logger, cycles: Optional[int] = None,
                sink: Optional["SupabaseSink"] = None, rollover: bool = False,
-               ai: Optional["AIStrategy"] = None) -> None:
+               ai: Optional["AIStrategy"] = None,
+               mem: Optional["PerformanceMemory"] = None) -> None:
     """Manage a position from the WebSocket feed, falling back to REST.
 
     In LIVE mode the real position is the source of truth: it is reconciled
@@ -1469,6 +1504,8 @@ def run_manage(cfg: Config, client: KalshiClient, signer: KalshiSigner,
     pending_until = 0.0        # do not place another order before this (live only)
     last_roll_check = time.time()
     last_ai_ts = 0.0           # throttle AI exit checks (cfg.ai_min_interval_sec)
+    if mem is not None:
+        mem.refresh(time.time())   # prime performance history before trading
     i = 0
     try:
         while cycles is None or i < cycles:
@@ -1530,19 +1567,42 @@ def run_manage(cfg: Config, client: KalshiClient, signer: KalshiSigner,
                 sink.record_position(run_id, ticker, pos.contracts, pos.entry_price_cents)
 
             now = time.time()
+            if mem is not None:
+                mem.maybe_refresh(now)
+            hist = mem.snapshot_block() if mem is not None else None
             placed = False
 
             if pos is None:
                 if now >= pending_until and top.valid and decide_entry(top, cfg):
                     qty = contracts_for_notional(top.yes_ask, cfg.target_notional_usd)
-                    # AI overlay: may veto or size the entry down (never up/looser).
                     why = "rule:enter"
+                    # Learning overlay: from realized history, pause after a losing
+                    # streak, skip a proven-negative entry price, or shrink size.
+                    # It can only reduce qty, never raise it.
+                    if mem is not None and mem.enabled and qty > 0:
+                        avoid, areason = mem.avoid_entry(top.yes_ask)
+                        if mem.paused:
+                            log_kv(logger, logging.INFO, "entry paused by learning",
+                                   reason=mem.notes)
+                            qty = 0
+                        elif avoid:
+                            log_kv(logger, logging.INFO, "entry skipped by learning",
+                                   reason=areason)
+                            qty = 0
+                        else:
+                            sized = mem.size(qty)
+                            if sized != qty:
+                                log_kv(logger, logging.INFO, "entry size trimmed by learning",
+                                       base_qty=qty, qty=sized,
+                                       scalar=round(mem.scalar, 2), reason=mem.notes)
+                            qty = sized
+                    # AI overlay: may veto or size the entry down (never up/looser).
                     if ai is not None and ai.enabled and qty > 0:
-                        ad = ai.decide(ai_snapshot(cfg, ticker, top, phase="entry"))
+                        ad = ai.decide(ai_snapshot(cfg, ticker, top, phase="entry", history=hist))
                         if ad is not None and sink:
                             sink.record_ai_decision(run_id, ticker, "entry", ad.action,
                                                     ad.confidence, ad.reason,
-                                                    ai_snapshot(cfg, ticker, top, phase="entry"))
+                                                    ai_snapshot(cfg, ticker, top, phase="entry", history=hist))
                         proceed, qty, why = gate_entry(ad, qty, cfg.ai_authority)
                         if not proceed:
                             log_kv(logger, logging.INFO, "entry skipped by AI", reason=why)
@@ -1568,7 +1628,7 @@ def run_manage(cfg: Config, client: KalshiClient, signer: KalshiSigner,
                 if (decision is None and ai is not None and ai.enabled and top.valid
                         and now - last_ai_ts >= cfg.ai_min_interval_sec):
                     last_ai_ts = now
-                    snap = ai_snapshot(cfg, ticker, top, pos=pos, phase="manage")
+                    snap = ai_snapshot(cfg, ticker, top, pos=pos, phase="manage", history=hist)
                     ad = ai.decide(snap)
                     if ad is not None and sink:
                         sink.record_ai_decision(run_id, ticker, "manage", ad.action,
@@ -1662,6 +1722,7 @@ def main(argv: Optional[list] = None) -> int:
     client = KalshiClient(cfg, signer, logger)
     sink = SupabaseSink(cfg, logger)
     ai = AIStrategy(cfg, logger)
+    mem = PerformanceMemory(cfg, logger, sink)
     interval = args.interval if args.interval is not None else cfg.poll_interval_sec
 
     if args.report:
@@ -1680,11 +1741,12 @@ def main(argv: Optional[list] = None) -> int:
         # Always-on worker: run indefinitely, following the hourly rollover.
         log_kv(logger, logging.INFO, "starting always-on worker (--forever)")
         run_manage(cfg, client, signer, logger, cycles=None, sink=sink,
-                   rollover=True, ai=ai)
+                   rollover=True, ai=ai, mem=mem)
         return 0
 
     if args.manage:
-        run_manage(cfg, client, signer, logger, cycles=args.cycles, sink=sink, ai=ai)
+        run_manage(cfg, client, signer, logger, cycles=args.cycles, sink=sink,
+                   ai=ai, mem=mem)
         return 0
 
     # Default: resolve and print the active ticker + top of book.

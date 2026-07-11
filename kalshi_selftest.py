@@ -494,6 +494,77 @@ def _test_ai_layer(chk):
         os.environ.pop("ANTHROPIC_API_KEY", None)
 
 
+def _test_performance_memory(chk):
+    import performance_memory as pm
+    from types import SimpleNamespace as NS
+
+    def tr(net, price=87, contracts=10):
+        return {"net_pnl": net, "entry_price": price,
+                "notional": price * contracts, "closed_at": "2026-07-11T00:00:00Z"}
+
+    # Cold start: below min_trades -> no adaptation, rules stand.
+    s = pm.summarize_trades([tr(50)] * 5)
+    chk.eq("cold-start counts trades", s["n"], 5)
+    th = pm.compute_throttle(s, min_trades=20, min_scalar=0.5, pause_loss_streak=5)
+    chk.eq("cold-start scalar 1.0", th["scalar"], 1.0)
+    chk.ok("cold-start no pause", th["pause"] is False)
+
+    # A losing book: negative expectancy shrinks size, a streak pauses entries.
+    losers = pm.summarize_trades([tr(-50)] * 20)
+    chk.ok("losers have negative expectancy", losers["expectancy_per_1000"] < 0)
+    chk.eq("loss streak counted", losers["recent_streak"], -20)
+    thl = pm.compute_throttle(losers, 20, 0.5, 5)
+    chk.eq("negative expectancy halves size", thl["scalar"], 0.5)
+    chk.ok("scalar never below floor", thl["scalar"] >= 0.5)
+    chk.ok("losing streak pauses entries", thl["pause"] is True)
+
+    # A winning book: full size, no pause. Learning never sizes UP past 1.0.
+    winners = pm.summarize_trades([tr(50)] * 20)
+    thw = pm.compute_throttle(winners, 20, 0.5, 5)
+    chk.eq("winning book keeps full size", thw["scalar"], 1.0)
+    chk.ok("winning book not paused", thw["pause"] is False)
+    chk.eq("win rate 100%", winners["win_rate"], 1.0)
+
+    # Per-entry-price veto: a proven-losing price is skipped, a winner kept.
+    mixed = [tr(-40, price=90) for _ in range(10)] + [tr(60, price=86) for _ in range(10)]
+    sm = pm.summarize_trades(mixed)
+    chk.ok("avoids proven-losing entry price", pm.should_avoid_entry(sm, 90, 8)[0] is True)
+    chk.ok("keeps proven-winning entry price", pm.should_avoid_entry(sm, 86, 8)[0] is False)
+    thin = pm.summarize_trades([tr(-40, price=88) for _ in range(3)])
+    chk.ok("won't veto on a thin sample", pm.should_avoid_entry(thin, 88, 8)[0] is False)
+
+    # The live wrapper: off by default, and a hard passthrough when disabled.
+    m = pm.PerformanceMemory(bot.Config(), logging.getLogger("t"), sink=None)
+    chk.ok("learning off by default", not m.enabled)
+    chk.eq("disabled size passthrough", m.size(100), 100)
+    chk.ok("disabled not paused", m.paused is False)
+    chk.ok("disabled snapshot None", m.snapshot_block() is None)
+
+    # Enabled with a stub sink whose session returns a losing history.
+    cfg = bot.Config()
+    cfg.learn_enabled = True
+    cfg.learn_min_trades = 5
+    rows = [tr(-50) for _ in range(10)]
+
+    class _Resp:
+        status_code = 200
+        text = ""
+        def json(self):
+            return list(reversed(rows))     # newest-first; memory re-reverses
+
+    class _Sess:
+        def get(self, *a, **k):
+            return _Resp()
+
+    stub_sink = NS(enabled=True, _base="http://x/rest/v1", _session=_Sess())
+    m2 = pm.PerformanceMemory(cfg, logging.getLogger("t"), sink=stub_sink)
+    chk.ok("learning enabled with sink", m2.enabled)
+    m2.refresh(1000.0)
+    chk.eq("enabled learns trade count", m2.stats["n"], 10)
+    chk.ok("size only shrinks on a losing book", m2.size(100) < 100)
+    chk.ok("snapshot present when enabled", m2.snapshot_block() is not None)
+
+
 def _test_signing(chk):
     """Generate an ephemeral RSA key, sign, and verify RSA-PSS/SHA-256."""
     if not bot._HAVE_CRYPTO:
@@ -551,6 +622,7 @@ def run_selftests(cfg=None, logger=None) -> int:
     _test_market_selection(chk)
     _test_get_top_from_market(chk)
     _test_ai_layer(chk)
+    _test_performance_memory(chk)
     _test_sign_strips_query(chk)
     _test_pem_normalize(chk)
     _test_reconcile(chk, cfg)
