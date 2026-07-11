@@ -1,0 +1,12 @@
+# Runtime artifacts
+*.db
+*.log
+*.log.*
+__pycache__/
+*.pyc
+
+# Secrets -- never commit keys or env files
+.env
+.env.*
+*.pem
+*.key
