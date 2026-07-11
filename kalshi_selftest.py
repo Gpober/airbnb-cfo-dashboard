@@ -315,23 +315,51 @@ def _test_market_selection(chk):
     chk.ok("no markets -> None",
            bot.resolve_active_ticker(_Empty(), "KXBTCD", logging.getLogger("t"), cfg) is None)
 
-    # List omits quotes -> probe get_market for the live quote and pick in-band.
-    quotes = {"P2": (86, 88)}
+    # List omits quotes -> probe across the strike ladder for a live quote.
+    quotes = {"KXBTCD-H-T110000": (86, 88)}  # only the near-money strike is quoted
 
     class _Probe:
         def get_all_markets(self, **kw):
             return [
-                {"ticker": "P1", "close_time": "2026-07-11T18:00:00Z", "yes_bid": 0, "yes_ask": 0, "volume": 100, "open_interest": 10},
-                {"ticker": "P2", "close_time": "2026-07-11T18:00:00Z", "yes_bid": 0, "yes_ask": 0, "volume": 50, "open_interest": 9},
-                {"ticker": "P3", "close_time": "2026-07-11T18:00:00Z", "yes_bid": 0, "yes_ask": 0, "volume": 1, "open_interest": 1},
+                {"ticker": "KXBTCD-H-T100000", "close_time": "2026-07-11T18:00:00Z", "yes_bid": 0, "yes_ask": 0},
+                {"ticker": "KXBTCD-H-T110000", "close_time": "2026-07-11T18:00:00Z", "yes_bid": 0, "yes_ask": 0},
+                {"ticker": "KXBTCD-H-T120000", "close_time": "2026-07-11T18:00:00Z", "yes_bid": 0, "yes_ask": 0},
             ]
 
         def get_market(self, ticker):
             yb, ya = quotes.get(ticker, (0, 0))
             return {"yes_bid": yb, "yes_ask": ya}
 
-    chk.eq("probe finds live-quoted in-band market",
-           bot.resolve_active_ticker(_Probe(), "KXBTCD", logging.getLogger("t"), cfg), "P2")
+    chk.eq("probe across ladder finds in-band strike",
+           bot.resolve_active_ticker(_Probe(), "KXBTCD", logging.getLogger("t"), cfg),
+           "KXBTCD-H-T110000")
+
+    # Realistic ladder: 201 strikes, LIST omits quotes, YES ask falls
+    # monotonically with strike (a "BTC above $X" book). The binary search must
+    # home in on the 85-90c strike near spot -- WITHOUT probing all 201.
+    class _BigLadder:
+        def __init__(self):
+            self.calls = 0
+            self.strikes = [60000 + i * 100 for i in range(201)]  # 60k..80k
+
+        def get_all_markets(self, **kw):
+            return [{"ticker": f"KXBTCD-H-T{s}", "close_time": "2026-07-11T18:00:00Z",
+                     "yes_bid": 0, "yes_ask": 0} for s in self.strikes]
+
+        def get_market(self, ticker):
+            self.calls += 1
+            s = float(ticker.rsplit("-T", 1)[1])
+            i = int((s - 60000) / 100)          # ladder index 0..200
+            ask = max(1, min(99, 99 - i))        # monotonic: low strike -> dear YES
+            return {"yes_bid": ask - 2, "yes_ask": ask}
+
+    big = _BigLadder()
+    picked = bot.resolve_active_ticker(big, "KXBTCD", logging.getLogger("t"), cfg)
+    picked_strike = float(picked.rsplit("-T", 1)[1])
+    picked_ask = 99 - int((picked_strike - 60000) / 100)
+    chk.ok("binary search lands in the 85-90c band",
+           cfg.entry_min_cents <= picked_ask <= cfg.entry_max_cents)
+    chk.ok("binary search is efficient (not a full ladder scan)", big.calls < 20)
 
 
 def _test_supabase_sink(chk):
@@ -423,6 +451,120 @@ def _test_pem_normalize(chk):
            (not s2.ready) and bool(s2.load_error))
 
 
+def _test_ai_layer(chk):
+    from types import SimpleNamespace as NS
+    import ai_strategy as ais
+
+    # Guardrails: AI can only veto or size DOWN, never up / never create entries.
+    chk.eq("no AI -> rules stand", ais.gate_entry(None, 100, "advisory")[:2], (True, 100))
+    hold = NS(action="hold", max_contracts=0, reason="thin", confidence=0.2)
+    chk.ok("AI veto blocks entry", ais.gate_entry(hold, 100, "advisory")[0] is False)
+    enter = NS(action="enter", max_contracts=10, reason="ok", confidence=0.9)
+    chk.eq("advisory keeps rule size", ais.gate_entry(enter, 100, "advisory")[1], 100)
+    chk.eq("decider sizes DOWN", ais.gate_entry(enter, 100, "decider")[1], 10)
+    big = NS(action="enter", max_contracts=999, reason="ok", confidence=0.9)
+    chk.eq("decider never sizes UP", ais.gate_entry(big, 100, "decider")[1], 100)
+
+    chk.eq("AI early exit fires", ais.ai_early_exit(NS(action="exit")), "exit")
+    chk.eq("AI scale_out fires", ais.ai_early_exit(NS(action="scale_out")), "scale_out")
+    chk.ok("no early exit on hold", ais.ai_early_exit(NS(action="hold")) is None)
+    chk.ok("no early exit on None", ais.ai_early_exit(None) is None)
+
+    # Off by default: no flag / no key -> disabled, decide() returns None.
+    strat = ais.AIStrategy(bot.Config(), logging.getLogger("t"))
+    chk.ok("AI off by default", not strat.enabled)
+    chk.ok("disabled decide -> None", strat.decide({}) is None)
+
+    # Enabled path with an injected client (no network) parses a decision.
+    if ais._HAVE_AI:
+        import os
+        os.environ["ANTHROPIC_API_KEY"] = "test-key"
+        cfg = bot.Config()
+        cfg.ai_enabled = True
+
+        class _Stub:
+            class messages:
+                @staticmethod
+                def parse(**kw):
+                    return NS(parsed_output=NS(action="enter", confidence=0.8,
+                                               max_contracts=5, reason="good setup"))
+        s = ais.AIStrategy(cfg, logging.getLogger("t"), client=_Stub())
+        chk.ok("AI enabled with key+client", s.enabled)
+        chk.eq("AI decide parses action", s.decide({"x": 1}).action, "enter")
+        os.environ.pop("ANTHROPIC_API_KEY", None)
+
+
+def _test_performance_memory(chk):
+    import performance_memory as pm
+    from types import SimpleNamespace as NS
+
+    def tr(net, price=87, contracts=10):
+        return {"net_pnl": net, "entry_price": price,
+                "notional": price * contracts, "closed_at": "2026-07-11T00:00:00Z"}
+
+    # Cold start: below min_trades -> no adaptation, rules stand.
+    s = pm.summarize_trades([tr(50)] * 5)
+    chk.eq("cold-start counts trades", s["n"], 5)
+    th = pm.compute_throttle(s, min_trades=20, min_scalar=0.5, pause_loss_streak=5)
+    chk.eq("cold-start scalar 1.0", th["scalar"], 1.0)
+    chk.ok("cold-start no pause", th["pause"] is False)
+
+    # A losing book: negative expectancy shrinks size, a streak pauses entries.
+    losers = pm.summarize_trades([tr(-50)] * 20)
+    chk.ok("losers have negative expectancy", losers["expectancy_per_1000"] < 0)
+    chk.eq("loss streak counted", losers["recent_streak"], -20)
+    thl = pm.compute_throttle(losers, 20, 0.5, 5)
+    chk.eq("negative expectancy halves size", thl["scalar"], 0.5)
+    chk.ok("scalar never below floor", thl["scalar"] >= 0.5)
+    chk.ok("losing streak pauses entries", thl["pause"] is True)
+
+    # A winning book: full size, no pause. Learning never sizes UP past 1.0.
+    winners = pm.summarize_trades([tr(50)] * 20)
+    thw = pm.compute_throttle(winners, 20, 0.5, 5)
+    chk.eq("winning book keeps full size", thw["scalar"], 1.0)
+    chk.ok("winning book not paused", thw["pause"] is False)
+    chk.eq("win rate 100%", winners["win_rate"], 1.0)
+
+    # Per-entry-price veto: a proven-losing price is skipped, a winner kept.
+    mixed = [tr(-40, price=90) for _ in range(10)] + [tr(60, price=86) for _ in range(10)]
+    sm = pm.summarize_trades(mixed)
+    chk.ok("avoids proven-losing entry price", pm.should_avoid_entry(sm, 90, 8)[0] is True)
+    chk.ok("keeps proven-winning entry price", pm.should_avoid_entry(sm, 86, 8)[0] is False)
+    thin = pm.summarize_trades([tr(-40, price=88) for _ in range(3)])
+    chk.ok("won't veto on a thin sample", pm.should_avoid_entry(thin, 88, 8)[0] is False)
+
+    # The live wrapper: off by default, and a hard passthrough when disabled.
+    m = pm.PerformanceMemory(bot.Config(), logging.getLogger("t"), sink=None)
+    chk.ok("learning off by default", not m.enabled)
+    chk.eq("disabled size passthrough", m.size(100), 100)
+    chk.ok("disabled not paused", m.paused is False)
+    chk.ok("disabled snapshot None", m.snapshot_block() is None)
+
+    # Enabled with a stub sink whose session returns a losing history.
+    cfg = bot.Config()
+    cfg.learn_enabled = True
+    cfg.learn_min_trades = 5
+    rows = [tr(-50) for _ in range(10)]
+
+    class _Resp:
+        status_code = 200
+        text = ""
+        def json(self):
+            return list(reversed(rows))     # newest-first; memory re-reverses
+
+    class _Sess:
+        def get(self, *a, **k):
+            return _Resp()
+
+    stub_sink = NS(enabled=True, _base="http://x/rest/v1", _session=_Sess())
+    m2 = pm.PerformanceMemory(cfg, logging.getLogger("t"), sink=stub_sink)
+    chk.ok("learning enabled with sink", m2.enabled)
+    m2.refresh(1000.0)
+    chk.eq("enabled learns trade count", m2.stats["n"], 10)
+    chk.ok("size only shrinks on a losing book", m2.size(100) < 100)
+    chk.ok("snapshot present when enabled", m2.snapshot_block() is not None)
+
+
 def _test_signing(chk):
     """Generate an ephemeral RSA key, sign, and verify RSA-PSS/SHA-256."""
     if not bot._HAVE_CRYPTO:
@@ -479,6 +621,8 @@ def run_selftests(cfg=None, logger=None) -> int:
     _test_supabase_sink(chk)
     _test_market_selection(chk)
     _test_get_top_from_market(chk)
+    _test_ai_layer(chk)
+    _test_performance_memory(chk)
     _test_sign_strips_query(chk)
     _test_pem_normalize(chk)
     _test_reconcile(chk, cfg)

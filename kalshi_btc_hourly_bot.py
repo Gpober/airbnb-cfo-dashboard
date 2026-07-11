@@ -62,6 +62,9 @@ from typing import Callable, Optional
 
 import requests
 
+from ai_strategy import AIStrategy, ai_early_exit, gate_entry  # optional AI layer
+from performance_memory import PerformanceMemory  # optional learning layer
+
 try:  # cryptography is required for real auth; keep import errors friendly.
     from cryptography.hazmat.primitives import hashes, serialization
     from cryptography.hazmat.primitives.asymmetric import padding, rsa
@@ -170,6 +173,44 @@ class Config:
     # (markets roll every hour, so a 24/7 bot must follow the rollover).
     rollover_check_sec: float = field(
         default_factory=lambda: _env_float("KALSHI_ROLLOVER_CHECK_SEC", 60.0)
+    )
+
+    # --- AI decision layer (optional; OFF by default) --------------------- #
+    # Needs the anthropic package + ANTHROPIC_API_KEY. The bot runs fully
+    # without it -- it only ever makes the deterministic strategy MORE
+    # conservative (veto / size-down / earlier exit), never looser.
+    ai_enabled: bool = field(default_factory=lambda: _env_bool("KALSHI_AI_ENABLED", False))
+    ai_authority: str = field(
+        default_factory=lambda: os.getenv("KALSHI_AI_AUTHORITY", "advisory")
+    )
+    ai_model: str = field(default_factory=lambda: os.getenv("KALSHI_AI_MODEL", "claude-opus-4-8"))
+    ai_min_interval_sec: float = field(
+        default_factory=lambda: _env_float("KALSHI_AI_MIN_INTERVAL_SEC", 30.0)
+    )
+
+    # --- Performance learning (optional; OFF by default) ------------------ #
+    # Reads the bot's own closed-trade history from Supabase and adapts. Like
+    # the AI layer, it can ONLY make the strategy more conservative: shrink
+    # size, skip a losing entry-price bucket, or pause after a losing streak.
+    # It never sizes up or loosens a limit. Needs the Supabase sink configured.
+    learn_enabled: bool = field(default_factory=lambda: _env_bool("KALSHI_LEARN_ENABLED", False))
+    learn_min_trades: int = field(default_factory=lambda: _env_int("KALSHI_LEARN_MIN_TRADES", 20))
+    learn_lookback: int = field(default_factory=lambda: _env_int("KALSHI_LEARN_LOOKBACK", 200))
+    learn_refresh_sec: float = field(
+        default_factory=lambda: _env_float("KALSHI_LEARN_REFRESH_SEC", 300.0)
+    )
+    # Floor on the size multiplier: learning may cut size to this fraction of
+    # base, never below (0.5 => at most a 50% cut).
+    learn_min_scalar: float = field(
+        default_factory=lambda: _env_float("KALSHI_LEARN_MIN_SCALAR", 0.5)
+    )
+    # Consecutive losing trades that pause new entries (existing exits still run).
+    learn_pause_loss_streak: int = field(
+        default_factory=lambda: _env_int("KALSHI_LEARN_PAUSE_LOSS_STREAK", 5)
+    )
+    # Min trades in an entry-price bucket before its (bad) stats can veto it.
+    learn_bucket_min_trades: int = field(
+        default_factory=lambda: _env_int("KALSHI_LEARN_BUCKET_MIN_TRADES", 8)
     )
 
     # --- Supabase sink (optional) ----------------------------------------- #
@@ -686,40 +727,83 @@ def resolve_active_ticker(client: KalshiClient, series_ticker: str,
     def _band(m):
         return cfg is not None and cfg.entry_min_cents <= _int(m.get("yes_ask")) <= cfg.entry_max_cents
 
+    def _strike(m):
+        # Strike is encoded in the ticker suffix, e.g. ...-T73299.99.
+        try:
+            return float(m.get("ticker", "").rsplit("-T", 1)[1])
+        except (IndexError, ValueError):
+            return None
+
     quoted = [m for m in hour if _int(m.get("yes_bid")) and _int(m.get("yes_ask"))]
 
-    # The /markets LIST often omits live quotes even when authenticated. If so,
-    # probe the most active strikes directly -- the single-market endpoint
-    # returns the live quote -- and stop as soon as we find an in-band one.
+    # The /markets LIST omits live quotes for KXBTCD, and a single hour has 200+
+    # strikes -- most deep in/out-of-the-money with empty books. For a "BTC above
+    # $X" contract the YES ask falls monotonically as the strike rises (a higher
+    # bar is less likely), so rather than blindly sampling the whole ladder we
+    # BINARY-SEARCH it for the strike whose YES ask lands in the entry band. That
+    # homes straight in on the near-the-money strikes -- where the 85-90c action
+    # and the liquidity are -- in ~log2(strikes) probes, and never wastes probes
+    # on the deep-ITM/OTM tails (the old even-sampling could land on a dead strike
+    # $9k away from spot). Empty strikes are skipped by scanning outward to the
+    # nearest quoted neighbour, so a thin book still resolves.
+    probes = 0
     if not quoted:
-        cands = sorted(hour, key=lambda m: _int(m.get("open_interest")) + _int(m.get("volume")),
-                       reverse=True)[:15]
-        for m in cands:
+        ladder = sorted((m for m in hour if _strike(m) is not None), key=_strike)
+        lo_c = cfg.entry_min_cents if cfg else 85
+        hi_c = cfg.entry_max_cents if cfg else 90
+
+        def _probe(m):
             try:
                 mk = client.get_market(m["ticker"])
             except Exception:
-                continue
+                return None
             yb, ya = _int(mk.get("yes_bid")), _int(mk.get("yes_ask"))
-            if yb and ya:
-                m = {**m, "yes_bid": yb, "yes_ask": ya}
-                quoted.append(m)
-                if _band(m):
+            return {**m, "yes_bid": yb, "yes_ask": ya} if yb and ya else None
+
+        lo, hi, seen = 0, len(ladder) - 1, set()
+        while lo <= hi and probes < 16:
+            mid = (lo + hi) // 2
+            hit = None
+            for off in range(hi - lo + 1):          # nearest quoted strike to mid
+                for j in (mid - off, mid + off):
+                    if lo <= j <= hi and j not in seen:
+                        seen.add(j)
+                        probes += 1
+                        q = _probe(ladder[j])
+                        if q is not None:
+                            hit = (j, q)
+                            break
+                if hit is not None or probes >= 16:
                     break
+            if hit is None:
+                break
+            j, q = hit
+            quoted.append(q)
+            ask = _int(q.get("yes_ask"))
+            if lo_c <= ask <= hi_c:
+                break                                # found the money -> stop
+            if ask > hi_c:
+                lo = j + 1                           # YES too dear -> strike too low
+            else:
+                hi = j - 1                           # YES too cheap -> strike too high
 
     in_band = [m for m in quoted if _band(m)]
-    pool = in_band or quoted
-    if not pool:
-        # Diagnostic: show what a top market actually looks like so we can see
-        # which fields Kalshi populates for this series.
+    if in_band:
+        pick = in_band[0]
+    elif quoted:
+        # No exact in-band strike right now: watch the quoted strike nearest the
+        # band (near-the-money) so ticks flow and we catch it entering the band.
+        mid = (cfg.entry_min_cents + cfg.entry_max_cents) / 2 if cfg else 50
+        pick = min(quoted, key=lambda m: abs(_int(m.get("yes_ask")) - mid))
+    else:
+        # Nothing quoted anywhere in the ladder -- e.g. thin weekend / overnight
+        # books. Log a sample and watch a real market so the loop stays healthy.
         s = max(hour, key=lambda m: _int(m.get("volume")))
-        log_kv(logger, logging.WARNING, "no quoted market; sample",
-               ticker=s.get("ticker"), yes_bid=s.get("yes_bid"), yes_ask=s.get("yes_ask"),
-               last_price=s.get("last_price"), volume=s.get("volume"),
-               open_interest=s.get("open_interest"), status=s.get("status"),
-               hour_markets=len(hour))
-        pool = hour  # nothing quoted -- fall back so we still watch a real market
+        log_kv(logger, logging.WARNING, "no quoted market in ladder (thin book?)",
+               ticker=s.get("ticker"), strikes=len(hour), probed=probes,
+               status=s.get("status"))
+        pick = s
 
-    pick = max(pool, key=lambda m: _int(m.get("volume")))
     log_kv(logger, logging.INFO, "selected market", ticker=pick["ticker"],
            yes_bid=pick.get("yes_bid"), yes_ask=pick.get("yes_ask"),
            in_band=bool(in_band), quoted=len(quoted), open_markets=len(markets))
@@ -767,6 +851,36 @@ def decide_exit(pos: Position, top: TopOfBook, cfg: Config) -> Optional[tuple]:
         qty = max(1, int(pos.remaining * cfg.scale_out_fraction))
         return ("scale_out", bid, qty)
     return None
+
+
+def ai_snapshot(cfg: Config, ticker: str, top: TopOfBook,
+                pos: Optional["Position"] = None, phase: str = "entry",
+                history: Optional[dict] = None) -> dict:
+    """Compact market/position snapshot handed to the AI decision layer.
+
+    ``history`` (when the learning layer is on) is the bot's own realized
+    performance so the AI can weigh how entries like this one have actually
+    paid off, not just reason from theory.
+    """
+    snap = {
+        "ticker": ticker, "phase": phase,
+        "yes_bid": top.yes_bid, "yes_ask": top.yes_ask,
+        "spread_cents": (top.yes_ask - top.yes_bid) if top.valid else None,
+        "entry_band": [cfg.entry_min_cents, cfg.entry_max_cents],
+        "take_profit_cents": cfg.take_profit_cents,
+        "stop_loss_cents": cfg.stop_loss_cents,
+        "fee_at_ask_cents": kalshi_fee_cents(1, top.yes_ask, cfg) if top.yes_ask else None,
+    }
+    if history:
+        snap["performance_history"] = history
+    if pos is not None:
+        unreal = ((top.yes_bid - pos.entry_price_cents) * pos.remaining
+                  if top.yes_bid is not None else None)
+        snap["position"] = {
+            "contracts": pos.remaining, "entry_price_cents": pos.entry_price_cents,
+            "unrealized_cents": unreal,
+        }
+    return snap
 
 
 # --------------------------------------------------------------------------- #
@@ -971,6 +1085,13 @@ class SupabaseSink:
             "ticker": ticker, "yes_bid": top.yes_bid, "yes_ask": top.yes_ask, "source": source,
         })
 
+    def record_ai_decision(self, run_id: str, ticker: str, phase: str, action: str,
+                           confidence: float, reason: str, snapshot: dict) -> None:
+        self._post("kalshi_ai_decisions", {
+            "run_id": run_id, "ticker": ticker, "phase": phase, "action": action,
+            "confidence": confidence, "reason": reason, "snapshot": snapshot,
+        })
+
     def _config_snapshot(self) -> dict:
         c = self.cfg
         return {
@@ -1018,11 +1139,14 @@ def run_paper(cfg: Config, client: KalshiClient, logger: logging.Logger,
               cycles: int, interval: float,
               book_source: Optional[Callable[[str], TopOfBook]] = None,
               ticker: Optional[str] = None,
-              sink: Optional["SupabaseSink"] = None) -> dict:
+              sink: Optional["SupabaseSink"] = None,
+              ai: Optional["AIStrategy"] = None) -> dict:
     """Paper-trade against the *live* order book, simulating fills locally.
 
     ``book_source(ticker) -> TopOfBook`` is injectable so the logic can be
-    exercised offline; by default it reads the live REST order book.
+    exercised offline; by default it reads the live REST order book. When ``ai``
+    is enabled the same veto / early-exit overlay runs, so you can backtest the
+    AI layer against the deterministic baseline before ever going live.
     """
     run_id = f"paper-{int(time.time())}"
     tradelog = TradeLog(cfg.db_path)
@@ -1056,6 +1180,15 @@ def run_paper(cfg: Config, client: KalshiClient, logger: logging.Logger,
         if pos is None:
             if decide_entry(top, cfg):
                 qty = contracts_for_notional(top.yes_ask, cfg.target_notional_usd)
+                if ai is not None and ai.enabled and qty > 0:
+                    ad = ai.decide(ai_snapshot(cfg, ticker, top, phase="entry"))
+                    if ad is not None and sink:
+                        sink.record_ai_decision(run_id, ticker, "entry", ad.action,
+                                                ad.confidence, ad.reason,
+                                                ai_snapshot(cfg, ticker, top, phase="entry"))
+                    proceed, qty, _ = gate_entry(ad, qty, cfg.ai_authority)
+                    if not proceed:
+                        qty = 0
                 if qty > 0:
                     entry_fee = kalshi_fee_cents(qty, top.yes_ask, cfg)
                     pos = Position(
@@ -1066,6 +1199,14 @@ def run_paper(cfg: Config, client: KalshiClient, logger: logging.Logger,
                            ticker=ticker, qty=qty, price=top.yes_ask, entry_fee=entry_fee)
         else:
             decision = decide_exit(pos, top, cfg)
+            if decision is None and ai is not None and ai.enabled:
+                ad = ai.decide(ai_snapshot(cfg, ticker, top, pos=pos, phase="manage"))
+                ea = ai_early_exit(ad)
+                if ea == "exit":
+                    decision = ("ai_exit", top.yes_bid, pos.remaining)
+                elif ea == "scale_out" and pos.remaining > 1:
+                    decision = ("ai_scale_out", top.yes_bid,
+                                max(1, int(pos.remaining * cfg.scale_out_fraction)))
             if decision:
                 reason, sell_price, qty = decision
                 simulate_fill_exit(pos, reason, sell_price, qty, cfg,
@@ -1309,7 +1450,9 @@ def reconcile_position_from_fills(client: KalshiClient, ticker: str,
 
 def run_manage(cfg: Config, client: KalshiClient, signer: KalshiSigner,
                logger: logging.Logger, cycles: Optional[int] = None,
-               sink: Optional["SupabaseSink"] = None, rollover: bool = False) -> None:
+               sink: Optional["SupabaseSink"] = None, rollover: bool = False,
+               ai: Optional["AIStrategy"] = None,
+               mem: Optional["PerformanceMemory"] = None) -> None:
     """Manage a position from the WebSocket feed, falling back to REST.
 
     In LIVE mode the real position is the source of truth: it is reconciled
@@ -1360,6 +1503,9 @@ def run_manage(cfg: Config, client: KalshiClient, signer: KalshiSigner,
     grace = max(2 * cfg.poll_interval_sec, 5.0)
     pending_until = 0.0        # do not place another order before this (live only)
     last_roll_check = time.time()
+    last_ai_ts = 0.0           # throttle AI exit checks (cfg.ai_min_interval_sec)
+    if mem is not None:
+        mem.refresh(time.time())   # prime performance history before trading
     i = 0
     try:
         while cycles is None or i < cycles:
@@ -1421,15 +1567,49 @@ def run_manage(cfg: Config, client: KalshiClient, signer: KalshiSigner,
                 sink.record_position(run_id, ticker, pos.contracts, pos.entry_price_cents)
 
             now = time.time()
+            if mem is not None:
+                mem.maybe_refresh(now)
+            hist = mem.snapshot_block() if mem is not None else None
             placed = False
 
             if pos is None:
                 if now >= pending_until and top.valid and decide_entry(top, cfg):
                     qty = contracts_for_notional(top.yes_ask, cfg.target_notional_usd)
+                    why = "rule:enter"
+                    # Learning overlay: from realized history, pause after a losing
+                    # streak, skip a proven-negative entry price, or shrink size.
+                    # It can only reduce qty, never raise it.
+                    if mem is not None and mem.enabled and qty > 0:
+                        avoid, areason = mem.avoid_entry(top.yes_ask)
+                        if mem.paused:
+                            log_kv(logger, logging.INFO, "entry paused by learning",
+                                   reason=mem.notes)
+                            qty = 0
+                        elif avoid:
+                            log_kv(logger, logging.INFO, "entry skipped by learning",
+                                   reason=areason)
+                            qty = 0
+                        else:
+                            sized = mem.size(qty)
+                            if sized != qty:
+                                log_kv(logger, logging.INFO, "entry size trimmed by learning",
+                                       base_qty=qty, qty=sized,
+                                       scalar=round(mem.scalar, 2), reason=mem.notes)
+                            qty = sized
+                    # AI overlay: may veto or size the entry down (never up/looser).
+                    if ai is not None and ai.enabled and qty > 0:
+                        ad = ai.decide(ai_snapshot(cfg, ticker, top, phase="entry", history=hist))
+                        if ad is not None and sink:
+                            sink.record_ai_decision(run_id, ticker, "entry", ad.action,
+                                                    ad.confidence, ad.reason,
+                                                    ai_snapshot(cfg, ticker, top, phase="entry", history=hist))
+                        proceed, qty, why = gate_entry(ad, qty, cfg.ai_authority)
+                        if not proceed:
+                            log_kv(logger, logging.INFO, "entry skipped by AI", reason=why)
                     if qty > 0:
                         coid = f"kbtc-{int(now*1000)}-{random.randint(0, 9999)}"
                         log_kv(logger, logging.INFO, "entry signal",
-                               price=top.yes_ask, qty=qty, source=source)
+                               price=top.yes_ask, qty=qty, source=source, why=why)
                         resp = client.place_order(ticker, "yes", "buy", qty,
                                                   top.yes_ask, client_order_id=coid)
                         placed = True
@@ -1444,6 +1624,21 @@ def run_manage(cfg: Config, client: KalshiClient, signer: KalshiSigner,
                                            entry_fee_cents=fee, opened_ts=now, remaining=qty)
             else:
                 decision = decide_exit(pos, top, cfg)
+                # AI overlay: may bring an exit FORWARD (rules' stop/TP still apply).
+                if (decision is None and ai is not None and ai.enabled and top.valid
+                        and now - last_ai_ts >= cfg.ai_min_interval_sec):
+                    last_ai_ts = now
+                    snap = ai_snapshot(cfg, ticker, top, pos=pos, phase="manage", history=hist)
+                    ad = ai.decide(snap)
+                    if ad is not None and sink:
+                        sink.record_ai_decision(run_id, ticker, "manage", ad.action,
+                                                ad.confidence, ad.reason, snap)
+                    ea = ai_early_exit(ad)
+                    if ea == "exit":
+                        decision = ("ai_exit", top.yes_bid, pos.remaining)
+                    elif ea == "scale_out" and pos.remaining > 1:
+                        decision = ("ai_scale_out", top.yes_bid,
+                                    max(1, int(pos.remaining * cfg.scale_out_fraction)))
                 if decision and now >= pending_until:
                     reason, sell_price, qty = decision
                     coid = f"kbtc-{int(now*1000)}-{random.randint(0, 9999)}"
@@ -1526,6 +1721,8 @@ def main(argv: Optional[list] = None) -> int:
                "(check KALSHI_PRIVATE_KEY_PEM formatting)", error=signer.load_error)
     client = KalshiClient(cfg, signer, logger)
     sink = SupabaseSink(cfg, logger)
+    ai = AIStrategy(cfg, logger)
+    mem = PerformanceMemory(cfg, logger, sink)
     interval = args.interval if args.interval is not None else cfg.poll_interval_sec
 
     if args.report:
@@ -1536,18 +1733,20 @@ def main(argv: Optional[list] = None) -> int:
 
     if args.paper:
         summary = run_paper(cfg, client, logger, cycles=args.cycles,
-                            interval=interval, sink=sink)
+                            interval=interval, sink=sink, ai=ai)
         print_summary(summary)
         return 0
 
     if args.forever:
         # Always-on worker: run indefinitely, following the hourly rollover.
         log_kv(logger, logging.INFO, "starting always-on worker (--forever)")
-        run_manage(cfg, client, signer, logger, cycles=None, sink=sink, rollover=True)
+        run_manage(cfg, client, signer, logger, cycles=None, sink=sink,
+                   rollover=True, ai=ai, mem=mem)
         return 0
 
     if args.manage:
-        run_manage(cfg, client, signer, logger, cycles=args.cycles, sink=sink)
+        run_manage(cfg, client, signer, logger, cycles=args.cycles, sink=sink,
+                   ai=ai, mem=mem)
         return 0
 
     # Default: resolve and print the active ticker + top of book.
