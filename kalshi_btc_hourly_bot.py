@@ -75,9 +75,13 @@ except Exception:  # pragma: no cover - only hit if cryptography is absent
 # Configuration
 # --------------------------------------------------------------------------- #
 
-PROD_BASE = "https://api.kalshi.com/trade-api/v2"
+# Kalshi endpoints. Production is api.elections.kalshi.com (the "elections"
+# subdomain serves ALL markets, not just elections); demo is demo-api.kalshi.co.
+# Both can be overridden via KALSHI_API_BASE / KALSHI_WS_BASE if Kalshi moves
+# hosts (e.g. external-api.kalshi.com for public market data).
+PROD_BASE = "https://api.elections.kalshi.com/trade-api/v2"
 DEMO_BASE = "https://demo-api.kalshi.co/trade-api/v2"
-PROD_WS = "wss://api.kalshi.com/trade-api/ws/v2"
+PROD_WS = "wss://api.elections.kalshi.com/trade-api/ws/v2"
 DEMO_WS = "wss://demo-api.kalshi.co/trade-api/ws/v2"
 
 
@@ -180,10 +184,16 @@ class Config:
 
     @property
     def base_url(self) -> str:
+        override = os.getenv("KALSHI_API_BASE")
+        if override:
+            return override.rstrip("/")
         return DEMO_BASE if self.demo else PROD_BASE
 
     @property
     def ws_url(self) -> str:
+        override = os.getenv("KALSHI_WS_BASE")
+        if override:
+            return override.rstrip("/")
         return DEMO_WS if self.demo else PROD_WS
 
     @property

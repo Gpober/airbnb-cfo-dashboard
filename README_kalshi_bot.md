@@ -89,6 +89,8 @@ Sources (verified July 2026):
 | `KALSHI_PRIVATE_KEY_PEM` | — | PEM contents (bot auto-repairs mangled newlines). |
 | `KALSHI_PRIVATE_KEY_B64` | — | **base64 of the PEM** — one unmanglable line. Preferred on Railway/Render/Fly. |
 | `KALSHI_SERIES_TICKER` | `KXBTCD` | Series to trade. |
+| `KALSHI_API_BASE` | — | Override the REST base URL (prod default `api.elections.kalshi.com`). |
+| `KALSHI_WS_BASE` | — | Override the WebSocket base URL. |
 | `KALSHI_ENTRY_MIN_CENTS` | `85` | Entry band low (YES ask). |
 | `KALSHI_ENTRY_MAX_CENTS` | `90` | Entry band high (YES ask). |
 | `KALSHI_TARGET_NOTIONAL_USD` | `1000` | Target $ per entry. |
