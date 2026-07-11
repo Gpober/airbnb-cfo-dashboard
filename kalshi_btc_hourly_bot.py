@@ -297,18 +297,47 @@ class KalshiSigner:
     def __init__(self, cfg: Config):
         self.cfg = cfg
         self._key = None
+        self.load_error: Optional[str] = None
         if cfg.api_key_id and (cfg.private_key_path or cfg.private_key_pem):
-            self._key = self._load_key()
+            # A bad/mangled key must not crash the whole worker at startup --
+            # record the error, stay "not ready", and let the caller log it.
+            try:
+                self._key = self._load_key()
+            except Exception as exc:
+                self.load_error = str(exc)
 
     def _load_key(self):
         if not _HAVE_CRYPTO:
             raise RuntimeError("cryptography is required for signed requests")
         if self.cfg.private_key_pem:
-            pem = self.cfg.private_key_pem.encode()
+            pem = self._normalize_pem(self.cfg.private_key_pem).encode()
         else:
             with open(self.cfg.private_key_path, "rb") as fh:  # type: ignore[arg-type]
                 pem = fh.read()
         return serialization.load_pem_private_key(pem, password=None)
+
+    @staticmethod
+    def _normalize_pem(s: str) -> str:
+        """Repair a PEM that a hosting UI mangled.
+
+        Env-var editors frequently strip real newlines or store them as the
+        literal two characters ``\\n``. A PEM without line breaks is invalid, so
+        we undo the common manglings before parsing.
+        """
+        s = s.strip().strip('"').strip("'")
+        if "\\n" in s and "\n" not in s:          # literal backslash-n -> newline
+            s = s.replace("\\n", "\n")
+        if "\n" not in s and "-----BEGIN" in s:   # all on one line -> rebuild
+            body = s.replace("-----BEGIN RSA PRIVATE KEY-----", "") \
+                    .replace("-----END RSA PRIVATE KEY-----", "") \
+                    .replace("-----BEGIN PRIVATE KEY-----", "") \
+                    .replace("-----END PRIVATE KEY-----", "").strip()
+            header = "-----BEGIN RSA PRIVATE KEY-----" if "RSA PRIVATE" in s \
+                else "-----BEGIN PRIVATE KEY-----"
+            footer = header.replace("BEGIN", "END")
+            wrapped = "\n".join(body[i:i + 64] for i in range(0, len(body), 64))
+            s = f"{header}\n{wrapped}\n{footer}"
+        return s
 
     @property
     def ready(self) -> bool:
@@ -1346,6 +1375,10 @@ def main(argv: Optional[list] = None) -> int:
 
     _banner(cfg, logger)
     signer = KalshiSigner(cfg)
+    if signer.load_error:
+        log_kv(logger, logging.ERROR,
+               "private key failed to load - running unauthenticated "
+               "(check KALSHI_PRIVATE_KEY_PEM formatting)", error=signer.load_error)
     client = KalshiClient(cfg, signer, logger)
     sink = SupabaseSink(cfg, logger)
     interval = args.interval if args.interval is not None else cfg.poll_interval_sec

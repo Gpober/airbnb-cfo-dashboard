@@ -275,6 +275,38 @@ def _test_supabase_sink(chk):
     chk.ok("disabled sink no-op", True)
 
 
+def _test_pem_normalize(chk):
+    """A PEM mangled by an env-var editor must still load (no startup crash)."""
+    if not bot._HAVE_CRYPTO:
+        print("  SKIP  pem normalize (cryptography not installed)")
+        return
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric import rsa
+
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    pem = key.private_bytes(
+        serialization.Encoding.PEM,
+        serialization.PrivateFormat.TraditionalOpenSSL,  # -----BEGIN RSA PRIVATE KEY-----
+        serialization.NoEncryption(),
+    ).decode()
+
+    # Case 1: real newlines replaced by the literal two chars backslash-n.
+    mangled = pem.replace("\n", "\\n")
+    cfg = bot.Config()
+    cfg.api_key_id = "kid"
+    cfg.private_key_pem = mangled
+    s1 = bot.KalshiSigner(cfg)
+    chk.ok("literal \\n PEM repaired + ready", s1.ready and not s1.load_error)
+
+    # Case 2: a bad key sets load_error but does NOT raise (no crash).
+    cfg2 = bot.Config()
+    cfg2.api_key_id = "kid"
+    cfg2.private_key_pem = "-----BEGIN RSA PRIVATE KEY-----\nnot-a-real-key\n-----END RSA PRIVATE KEY-----"
+    s2 = bot.KalshiSigner(cfg2)
+    chk.ok("bad key -> not ready, error recorded, no crash",
+           (not s2.ready) and bool(s2.load_error))
+
+
 def _test_signing(chk):
     """Generate an ephemeral RSA key, sign, and verify RSA-PSS/SHA-256."""
     if not bot._HAVE_CRYPTO:
@@ -329,6 +361,7 @@ def run_selftests(cfg=None, logger=None) -> int:
     _test_ws_desync(chk, cfg)
     _test_manage_dryrun(chk)
     _test_supabase_sink(chk)
+    _test_pem_normalize(chk)
     _test_reconcile(chk, cfg)
     _test_paper_harness(chk, cfg)
     _test_signing(chk)
