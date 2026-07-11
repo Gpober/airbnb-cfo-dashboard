@@ -549,7 +549,26 @@ class KalshiClient:
         data = self._request("GET", path, signed=False)
         return data.get("orderbook", {})
 
+    def get_market(self, ticker: str) -> dict:
+        data = self._request("GET", f"/markets/{ticker}", signed=False)
+        return data.get("market", {})
+
     def get_top(self, ticker: str) -> TopOfBook:
+        """Top-of-book for ``ticker``.
+
+        Prefer the market object's own ``yes_bid``/``yes_ask`` quote (public and
+        reliably populated). The dedicated order-book endpoint can require auth
+        and come back empty, so it's only a fallback.
+        """
+        try:
+            m = self.get_market(ticker)
+            yb = int(m.get("yes_bid") or 0)
+            ya = int(m.get("yes_ask") or 0)
+            top = TopOfBook(yes_bid=yb or None, yes_ask=ya or None, ts=time.time())
+            if top.valid:
+                return top
+        except Exception:
+            pass  # fall through to the order-book endpoint
         return top_from_orderbook(self.get_orderbook(ticker, depth=1))
 
     # -- authenticated endpoints ----------------------------------------- #

@@ -229,6 +229,22 @@ def _test_paper_harness(chk, cfg):
     chk.ok("paper expectancy computed", "net_expectancy_per_1000_cents" in summary)
 
 
+def _test_get_top_from_market(chk):
+    cfg = bot.Config()
+    client = bot.KalshiClient(cfg, bot.KalshiSigner(cfg), logging.getLogger("t"))
+    # Market object carries a quote -> used directly (order book not needed).
+    client.get_market = lambda t: {"yes_bid": 86, "yes_ask": 88}
+    client.get_orderbook = lambda t, depth=1: {"yes": [], "no": []}
+    top = client.get_top("X")
+    chk.eq("get_top uses market yes_bid", top.yes_bid, 86)
+    chk.eq("get_top uses market yes_ask", top.yes_ask, 88)
+    # Empty market quote -> fall back to the order book endpoint.
+    client.get_market = lambda t: {"yes_bid": 0, "yes_ask": 0}
+    client.get_orderbook = lambda t, depth=1: {"yes": [[70, 5]], "no": [[11, 3]]}
+    top2 = client.get_top("X")
+    chk.eq("get_top falls back to orderbook", (top2.yes_bid, top2.yes_ask), (70, 89))
+
+
 def _test_market_selection(chk):
     cfg = bot.Config()  # entry band 85-90
 
@@ -406,6 +422,7 @@ def run_selftests(cfg=None, logger=None) -> int:
     _test_manage_dryrun(chk)
     _test_supabase_sink(chk)
     _test_market_selection(chk)
+    _test_get_top_from_market(chk)
     _test_pem_normalize(chk)
     _test_reconcile(chk, cfg)
     _test_paper_harness(chk, cfg)
