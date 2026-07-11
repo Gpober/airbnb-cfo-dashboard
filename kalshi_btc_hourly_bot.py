@@ -522,7 +522,9 @@ class KalshiClient:
     def get_markets(self, **params) -> dict:
         query = "&".join(f"{k}={v}" for k, v in params.items() if v is not None)
         path = "/markets" + (f"?{query}" if query else "")
-        return self._request("GET", path, signed=False)
+        # Sign when we have a key: Kalshi populates live quotes/order books only
+        # for authenticated requests. Falls back to unsigned when no key is set.
+        return self._request("GET", path, signed=self.signer.ready)
 
     def get_all_markets(self, max_pages: int = 10, **params) -> list:
         """Fetch markets across pages (KXBTCD is a large strike ladder).
@@ -546,11 +548,11 @@ class KalshiClient:
 
     def get_orderbook(self, ticker: str, depth: int = 1) -> dict:
         path = f"/markets/{ticker}/orderbook?depth={depth}"
-        data = self._request("GET", path, signed=False)
+        data = self._request("GET", path, signed=self.signer.ready)
         return data.get("orderbook", {})
 
     def get_market(self, ticker: str) -> dict:
-        data = self._request("GET", f"/markets/{ticker}", signed=False)
+        data = self._request("GET", f"/markets/{ticker}", signed=self.signer.ready)
         return data.get("market", {})
 
     def get_top(self, ticker: str) -> TopOfBook:
