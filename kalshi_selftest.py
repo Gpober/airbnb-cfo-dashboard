@@ -229,6 +229,44 @@ def _test_paper_harness(chk, cfg):
     chk.ok("paper expectancy computed", "net_expectancy_per_1000_cents" in summary)
 
 
+def _test_sign_strips_query(chk):
+    """The signed path must exclude the query string (Kalshi requirement)."""
+    if not bot._HAVE_CRYPTO:
+        print("  SKIP  sign strips query (cryptography not installed)")
+        return
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric import rsa
+
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    pem = key.private_bytes(serialization.Encoding.PEM,
+                            serialization.PrivateFormat.PKCS8,
+                            serialization.NoEncryption()).decode()
+    cfg = bot.Config()
+    cfg.api_key_id = "kid"
+    cfg.private_key_pem = pem
+    signer = bot.KalshiSigner(cfg)
+    client = bot.KalshiClient(cfg, signer, logging.getLogger("t"))
+
+    captured = {}
+    real_sign = signer.sign
+    signer.sign = lambda method, path: (captured.__setitem__("path", path) or real_sign(method, path))
+
+    class _Resp:
+        status_code = 200
+        content = b'{"fills":[]}'
+
+        def json(self):
+            return {"fills": []}
+
+        def raise_for_status(self):
+            pass
+
+    client.session.request = lambda *a, **k: _Resp()
+    client.get_fills(ticker="KXBTCD-X", limit=200)
+    chk.eq("signed path has no query string",
+           captured.get("path"), "/trade-api/v2/portfolio/fills")
+
+
 def _test_get_top_from_market(chk):
     cfg = bot.Config()
     client = bot.KalshiClient(cfg, bot.KalshiSigner(cfg), logging.getLogger("t"))
@@ -423,6 +461,7 @@ def run_selftests(cfg=None, logger=None) -> int:
     _test_supabase_sink(chk)
     _test_market_selection(chk)
     _test_get_top_from_market(chk)
+    _test_sign_strips_query(chk)
     _test_pem_normalize(chk)
     _test_reconcile(chk, cfg)
     _test_paper_harness(chk, cfg)

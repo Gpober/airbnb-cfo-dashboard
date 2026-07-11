@@ -464,8 +464,11 @@ class KalshiClient:
             attempt += 1
             headers = {"Content-Type": "application/json", "Accept": "application/json"}
             if signed:
-                # Sign the full path (prefix + query), which is what we send.
-                headers.update(self.signer.sign(method, f"/trade-api/v2{path}"))
+                # Kalshi signs the path WITHOUT the query string: strip everything
+                # from the first '?'. Signing the query string yields a bad
+                # signature and a 401 on any request with query params.
+                sign_path = f"/trade-api/v2{path.split('?', 1)[0]}"
+                headers.update(self.signer.sign(method, sign_path))
             try:
                 resp = self.session.request(
                     method,
