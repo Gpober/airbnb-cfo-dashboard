@@ -686,40 +686,48 @@ def resolve_active_ticker(client: KalshiClient, series_ticker: str,
     def _band(m):
         return cfg is not None and cfg.entry_min_cents <= _int(m.get("yes_ask")) <= cfg.entry_max_cents
 
+    def _strike(m):
+        # Strike is encoded in the ticker suffix, e.g. ...-T73299.99.
+        try:
+            return float(m.get("ticker", "").rsplit("-T", 1)[1])
+        except (IndexError, ValueError):
+            return None
+
     quoted = [m for m in hour if _int(m.get("yes_bid")) and _int(m.get("yes_ask"))]
 
-    # The /markets LIST often omits live quotes even when authenticated. If so,
-    # probe the most active strikes directly -- the single-market endpoint
-    # returns the live quote -- and stop as soon as we find an in-band one.
+    # The /markets LIST omits live quotes for KXBTCD, and most strikes are deep
+    # in/out-of-the-money with empty books. YES price moves monotonically with
+    # strike, so sample evenly ACROSS the strike ladder (single-market endpoint
+    # returns the live quote) to find the near-the-money strikes that are quoted.
     if not quoted:
-        cands = sorted(hour, key=lambda m: _int(m.get("open_interest")) + _int(m.get("volume")),
-                       reverse=True)[:15]
-        for m in cands:
+        ladder = sorted((m for m in hour if _strike(m) is not None), key=_strike)
+        step = max(1, len(ladder) // 30)
+        for m in ladder[::step]:
             try:
                 mk = client.get_market(m["ticker"])
             except Exception:
                 continue
             yb, ya = _int(mk.get("yes_bid")), _int(mk.get("yes_ask"))
             if yb and ya:
-                m = {**m, "yes_bid": yb, "yes_ask": ya}
-                quoted.append(m)
-                if _band(m):
-                    break
+                quoted.append({**m, "yes_bid": yb, "yes_ask": ya})
 
     in_band = [m for m in quoted if _band(m)]
-    pool = in_band or quoted
-    if not pool:
-        # Diagnostic: show what a top market actually looks like so we can see
-        # which fields Kalshi populates for this series.
+    if in_band:
+        pick = in_band[0]
+    elif quoted:
+        # No exact in-band strike right now: watch the quoted strike nearest the
+        # band (near-the-money) so ticks flow and we catch it entering the band.
+        mid = (cfg.entry_min_cents + cfg.entry_max_cents) / 2 if cfg else 50
+        pick = min(quoted, key=lambda m: abs(_int(m.get("yes_ask")) - mid))
+    else:
+        # Nothing quoted anywhere in the ladder -- e.g. thin weekend / overnight
+        # books. Log a sample and watch a real market so the loop stays healthy.
         s = max(hour, key=lambda m: _int(m.get("volume")))
-        log_kv(logger, logging.WARNING, "no quoted market; sample",
-               ticker=s.get("ticker"), yes_bid=s.get("yes_bid"), yes_ask=s.get("yes_ask"),
-               last_price=s.get("last_price"), volume=s.get("volume"),
-               open_interest=s.get("open_interest"), status=s.get("status"),
-               hour_markets=len(hour))
-        pool = hour  # nothing quoted -- fall back so we still watch a real market
+        log_kv(logger, logging.WARNING, "no quoted market in ladder (thin book?)",
+               ticker=s.get("ticker"), strikes=len(hour), sampled=len(hour[::max(1, len(hour)//30)]),
+               status=s.get("status"))
+        pick = s
 
-    pick = max(pool, key=lambda m: _int(m.get("volume")))
     log_kv(logger, logging.INFO, "selected market", ticker=pick["ticker"],
            yes_bid=pick.get("yes_bid"), yes_ask=pick.get("yes_ask"),
            in_band=bool(in_band), quoted=len(quoted), open_markets=len(markets))

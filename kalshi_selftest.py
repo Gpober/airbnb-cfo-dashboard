@@ -315,23 +315,24 @@ def _test_market_selection(chk):
     chk.ok("no markets -> None",
            bot.resolve_active_ticker(_Empty(), "KXBTCD", logging.getLogger("t"), cfg) is None)
 
-    # List omits quotes -> probe get_market for the live quote and pick in-band.
-    quotes = {"P2": (86, 88)}
+    # List omits quotes -> probe across the strike ladder for a live quote.
+    quotes = {"KXBTCD-H-T110000": (86, 88)}  # only the near-money strike is quoted
 
     class _Probe:
         def get_all_markets(self, **kw):
             return [
-                {"ticker": "P1", "close_time": "2026-07-11T18:00:00Z", "yes_bid": 0, "yes_ask": 0, "volume": 100, "open_interest": 10},
-                {"ticker": "P2", "close_time": "2026-07-11T18:00:00Z", "yes_bid": 0, "yes_ask": 0, "volume": 50, "open_interest": 9},
-                {"ticker": "P3", "close_time": "2026-07-11T18:00:00Z", "yes_bid": 0, "yes_ask": 0, "volume": 1, "open_interest": 1},
+                {"ticker": "KXBTCD-H-T100000", "close_time": "2026-07-11T18:00:00Z", "yes_bid": 0, "yes_ask": 0},
+                {"ticker": "KXBTCD-H-T110000", "close_time": "2026-07-11T18:00:00Z", "yes_bid": 0, "yes_ask": 0},
+                {"ticker": "KXBTCD-H-T120000", "close_time": "2026-07-11T18:00:00Z", "yes_bid": 0, "yes_ask": 0},
             ]
 
         def get_market(self, ticker):
             yb, ya = quotes.get(ticker, (0, 0))
             return {"yes_bid": yb, "yes_ask": ya}
 
-    chk.eq("probe finds live-quoted in-band market",
-           bot.resolve_active_ticker(_Probe(), "KXBTCD", logging.getLogger("t"), cfg), "P2")
+    chk.eq("probe across ladder finds in-band strike",
+           bot.resolve_active_ticker(_Probe(), "KXBTCD", logging.getLogger("t"), cfg),
+           "KXBTCD-H-T110000")
 
 
 def _test_supabase_sink(chk):
