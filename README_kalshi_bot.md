@@ -99,10 +99,52 @@ Sources (verified July 2026):
 | `KALSHI_FEE_MAKER_FRACTION` | `0.25` | Maker fee as a fraction of taker. |
 | `KALSHI_ASSUME_MAKER` | `false` | Price fills as maker in the fee calc. |
 | `KALSHI_POLL_INTERVAL_SEC` | `5` | Manage-loop / default interval. |
+| `KALSHI_ROLLOVER_CHECK_SEC` | `60` | How often `--forever` re-checks the active hourly ticker. |
 | `KALSHI_MAX_RETRIES` | `6` | REST retry budget (429/5xx/connection). |
 | `KALSHI_REQUEST_TIMEOUT_SEC` | `15` | Per-request timeout. |
 | `KALSHI_DB_PATH` | `kalshi_bot.db` | SQLite trade log path. |
 | `KALSHI_LOG_PATH` | `kalshi_bot.log` | Structured JSON log path (rotating). |
+| `SUPABASE_URL` | — | Supabase project URL. Enables the Supabase mirror when set with the key below. |
+| `SUPABASE_SERVICE_ROLE_KEY` | — | Supabase **service-role** key (server-side only). Writes bypass RLS. |
+
+> On a filesystem-less host (or when you'd rather not mount a file), pass the
+> key inline via `KALSHI_PRIVATE_KEY_PEM` (the full PEM text) instead of
+> `KALSHI_PRIVATE_KEY_PATH`.
+
+## Deployment (always-on worker + dashboard)
+
+The strategy needs a process that stays up 24/7 (constant BTC volatility, tight
+stop-loss, live WebSocket). **Vercel is serverless and cannot host that** — it
+has no persistent process. The clean split:
+
+| Piece | Host | Env vars it needs |
+|---|---|---|
+| **Bot** (`--forever`) | a persistent worker — **Railway** / Render / Fly.io | `KALSHI_API_KEY_ID`, `KALSHI_PRIVATE_KEY_PEM`, `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY` (+ `KALSHI_DEMO`/`KALSHI_DRY_RUN`) |
+| **Dashboard** (optional) | **Vercel** | `NEXT_PUBLIC_SUPABASE_URL` only (read Supabase server-side with the service-role key) |
+
+The `--forever` worker runs the manage loop indefinitely and **follows the
+hourly rollover**: it re-resolves the active `KXBTCD` market every
+`KALSHI_ROLLOVER_CHECK_SEC` and reconnects the WebSocket to the new contract.
+
+**Deploy (Railway example):**
+1. Push this repo to GitHub (done).
+2. Railway → New Project → Deploy from GitHub repo → pick this repo. It builds
+   the included `Dockerfile` automatically (which runs `--selftest` at build
+   time and starts `--forever`).
+3. Railway → Variables → add the worker env vars from the table above. Keep
+   `KALSHI_DEMO=true` and `KALSHI_DRY_RUN=true` until you've validated.
+4. Deploy. Watch the logs for `resolved active ticker` and `reconciled …`.
+
+`Dockerfile`, `Procfile`, and `railway.json` are included; Render and Fly.io
+consume the same `Dockerfile` (`render.yaml`/`fly.toml` not included but the
+image is identical).
+
+### Supabase mirror
+
+When `SUPABASE_URL` + `SUPABASE_SERVICE_ROLE_KEY` are set, every run, trade,
+order, position, and tick is written to the `kalshi_*` tables (best-effort — a
+Supabase outage never interrupts trading; local SQLite stays the durable log).
+Leave them unset and the bot runs exactly as before with no external writes.
 
 ## Robustness
 

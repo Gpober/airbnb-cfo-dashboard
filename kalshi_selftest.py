@@ -160,7 +160,8 @@ def _test_manage_dryrun(chk):
             state["i"] += 1
             return b
 
-        def place_order(self, ticker, side, action, count, price_cents, order_type="limit"):
+        def place_order(self, ticker, side, action, count, price_cents,
+                        order_type="limit", client_order_id=None):
             orders.append((action, count, price_cents))
             return {"dry_run": True}
 
@@ -227,6 +228,53 @@ def _test_paper_harness(chk, cfg):
     chk.ok("paper expectancy computed", "net_expectancy_per_1000_cents" in summary)
 
 
+def _test_supabase_sink(chk):
+    cfg = bot.Config()
+    cfg.supabase_url = "https://example.supabase.co"
+    cfg.supabase_service_key = "svc-role-key"
+    sink = bot.SupabaseSink(cfg, logging.getLogger("t"))
+    chk.ok("sink enabled when configured", sink.enabled)
+
+    calls = []
+
+    class _Resp:
+        status_code = 201
+        text = ""
+
+    class _StubSession:
+        headers = {}
+
+        def post(self, url, params=None, headers=None, json=None, timeout=None):
+            calls.append(("POST", url, json))
+            return _Resp()
+
+        def patch(self, url, params=None, headers=None, json=None, timeout=None):
+            calls.append(("PATCH", url, json))
+            return _Resp()
+
+    sink._session = _StubSession()
+    sink.start_run("run-1", "paper")
+    sink.record_trade("run-1", "T", "take_profit", 10, 87, 99, 1, 1, 1000.0, 1005.0)
+
+    trade_calls = [c for c in calls if c[1].endswith("/kalshi_trades")]
+    chk.eq("trade posted once", len(trade_calls), 1)
+    row = trade_calls[0][2]
+    chk.eq("sink gross_pnl", row["gross_pnl"], (99 - 87) * 10)
+    chk.eq("sink net_pnl", row["net_pnl"], (99 - 87) * 10 - 1 - 1)
+    chk.eq("sink notional", row["notional"], 87 * 10)
+    chk.ok("run posted to kalshi_runs",
+           any(c[1].endswith("/kalshi_runs") for c in calls))
+
+    # Disabled sink (no env) must be a silent no-op.
+    cfg2 = bot.Config()
+    cfg2.supabase_url = None
+    cfg2.supabase_service_key = None
+    sink2 = bot.SupabaseSink(cfg2, logging.getLogger("t"))
+    chk.ok("sink disabled without config", not sink2.enabled)
+    sink2.record_trade("r", "T", "stop_loss", 1, 50, 49, 1, 1, 0.0, 1.0)  # no raise
+    chk.ok("disabled sink no-op", True)
+
+
 def _test_signing(chk):
     """Generate an ephemeral RSA key, sign, and verify RSA-PSS/SHA-256."""
     if not bot._HAVE_CRYPTO:
@@ -280,6 +328,7 @@ def run_selftests(cfg=None, logger=None) -> int:
     _test_ws_parsing(chk, cfg)
     _test_ws_desync(chk, cfg)
     _test_manage_dryrun(chk)
+    _test_supabase_sink(chk)
     _test_reconcile(chk, cfg)
     _test_paper_harness(chk, cfg)
     _test_signing(chk)

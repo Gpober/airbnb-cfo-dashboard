@@ -157,6 +157,21 @@ class Config:
     request_timeout_sec: float = field(
         default_factory=lambda: _env_float("KALSHI_REQUEST_TIMEOUT_SEC", 15.0)
     )
+    # How often the always-on manager re-checks for the active hourly ticker
+    # (markets roll every hour, so a 24/7 bot must follow the rollover).
+    rollover_check_sec: float = field(
+        default_factory=lambda: _env_float("KALSHI_ROLLOVER_CHECK_SEC", 60.0)
+    )
+
+    # --- Supabase sink (optional) ----------------------------------------- #
+    # If both are set, runs/trades/fills/orders are mirrored to Supabase.
+    # Use the SERVICE-ROLE key (server-side only) so writes bypass RLS.
+    supabase_url: Optional[str] = field(
+        default_factory=lambda: os.getenv("SUPABASE_URL") or os.getenv("NEXT_PUBLIC_SUPABASE_URL")
+    )
+    supabase_service_key: Optional[str] = field(
+        default_factory=lambda: os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+    )
 
     @property
     def base_url(self) -> str:
@@ -486,11 +501,15 @@ class KalshiClient:
         return data.get("market_positions", [])
 
     def place_order(self, ticker: str, side: str, action: str, count: int,
-                    price_cents: int, order_type: str = "limit") -> dict:
+                    price_cents: int, order_type: str = "limit",
+                    client_order_id: Optional[str] = None) -> dict:
         """Place an order. NO-OP unless live orders are explicitly enabled.
 
-        ``side`` is 'yes'/'no', ``action`` is 'buy'/'sell'.
+        ``side`` is 'yes'/'no', ``action`` is 'buy'/'sell'. The returned dict
+        always carries ``client_order_id`` so callers can correlate the order
+        with its fills.
         """
+        coid = client_order_id or f"kbtc-{int(time.time()*1000)}-{random.randint(0, 9999)}"
         body = {
             "ticker": ticker,
             "action": action,
@@ -498,7 +517,7 @@ class KalshiClient:
             "count": count,
             "type": order_type,
             # client_order_id makes retries idempotent on Kalshi's side.
-            "client_order_id": f"kbtc-{int(time.time()*1000)}-{random.randint(0, 9999)}",
+            "client_order_id": coid,
         }
         if order_type == "limit":
             # Kalshi expects the limit price on the side being traded.
@@ -692,13 +711,130 @@ def print_summary(summary: dict) -> None:
 
 
 # --------------------------------------------------------------------------- #
+# Supabase sink (optional) -- mirrors runs/trades/fills/orders to Postgres
+# --------------------------------------------------------------------------- #
+
+
+class SupabaseSink:
+    """Best-effort writer to Supabase via PostgREST.
+
+    Enabled only when SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY are set. Every
+    call is wrapped so a Supabase hiccup can never crash the trading loop -- the
+    local SQLite log remains the durable record; Supabase is the shared mirror
+    the dashboard reads.
+    """
+
+    def __init__(self, cfg: Config, logger: logging.Logger):
+        self.cfg = cfg
+        self.log = logger
+        self.enabled = bool(cfg.supabase_url and cfg.supabase_service_key)
+        self._base = (cfg.supabase_url or "").rstrip("/") + "/rest/v1"
+        self._session = requests.Session()
+        if self.enabled:
+            self._session.headers.update({
+                "apikey": cfg.supabase_service_key,
+                "Authorization": f"Bearer {cfg.supabase_service_key}",
+                "Content-Type": "application/json",
+            })
+            log_kv(logger, logging.INFO, "supabase sink enabled", url=cfg.supabase_url)
+
+    def _post(self, table: str, row: dict, on_conflict: Optional[str] = None) -> None:
+        if not self.enabled:
+            return
+        params = {}
+        headers = {"Prefer": "return=minimal"}
+        if on_conflict:
+            params["on_conflict"] = on_conflict
+            headers["Prefer"] = "resolution=merge-duplicates,return=minimal"
+        try:
+            resp = self._session.post(
+                f"{self._base}/{table}", params=params, headers=headers,
+                json=row, timeout=self.cfg.request_timeout_sec,
+            )
+            if resp.status_code >= 300:
+                log_kv(self.log, logging.WARNING, "supabase write failed",
+                       table=table, status=resp.status_code, body=resp.text[:300])
+        except requests.RequestException as exc:
+            log_kv(self.log, logging.WARNING, "supabase unreachable", table=table, error=str(exc))
+
+    # -- typed helpers ---------------------------------------------------- #
+
+    def start_run(self, run_id: str, mode: str) -> None:
+        self._post("kalshi_runs", {
+            "run_id": run_id, "mode": mode, "series_ticker": self.cfg.series_ticker,
+            "config": self._config_snapshot(),
+        }, on_conflict="run_id")
+
+    def end_run(self, run_id: str) -> None:
+        # PATCH the run's ended_at; use POST upsert to keep it single-path.
+        if not self.enabled:
+            return
+        try:
+            self._session.patch(
+                f"{self._base}/kalshi_runs", params={"run_id": f"eq.{run_id}"},
+                headers={"Prefer": "return=minimal"},
+                json={"ended_at": "now()"}, timeout=self.cfg.request_timeout_sec,
+            )
+        except requests.RequestException as exc:
+            log_kv(self.log, logging.WARNING, "supabase end_run failed", error=str(exc))
+
+    def record_trade(self, run_id: str, ticker: str, reason: str, contracts: int,
+                     entry_price: int, exit_price: int, entry_fee: int, exit_fee: int,
+                     opened_ts: float, closed_ts: float) -> None:
+        gross = (exit_price - entry_price) * contracts
+        self._post("kalshi_trades", {
+            "run_id": run_id, "ticker": ticker, "reason": reason, "contracts": contracts,
+            "entry_price": entry_price, "exit_price": exit_price,
+            "entry_fee": entry_fee, "exit_fee": exit_fee,
+            "gross_pnl": gross, "net_pnl": gross - entry_fee - exit_fee,
+            "notional": entry_price * contracts, "hold_secs": closed_ts - opened_ts,
+            "opened_at": _iso(opened_ts), "closed_at": _iso(closed_ts),
+        })
+
+    def record_order(self, run_id: str, ticker: str, side: str, action: str,
+                     count: int, price: Optional[int], client_order_id: str,
+                     dry_run: bool, status: str = "submitted", raw: Optional[dict] = None) -> None:
+        self._post("kalshi_orders", {
+            "client_order_id": client_order_id, "run_id": run_id, "ticker": ticker,
+            "side": side, "action": action, "count": count, "price": price,
+            "dry_run": dry_run, "status": status, "raw": raw,
+        }, on_conflict="client_order_id")
+
+    def record_position(self, run_id: str, ticker: str, net: int, avg_entry: int) -> None:
+        self._post("kalshi_positions", {
+            "run_id": run_id, "ticker": ticker, "net_contracts": net, "avg_entry": avg_entry,
+        })
+
+    def record_tick(self, ticker: str, top: "TopOfBook", source: str) -> None:
+        self._post("kalshi_market_ticks", {
+            "ticker": ticker, "yes_bid": top.yes_bid, "yes_ask": top.yes_ask, "source": source,
+        })
+
+    def _config_snapshot(self) -> dict:
+        c = self.cfg
+        return {
+            "entry_min_cents": c.entry_min_cents, "entry_max_cents": c.entry_max_cents,
+            "target_notional_usd": c.target_notional_usd, "stop_loss_cents": c.stop_loss_cents,
+            "take_profit_cents": c.take_profit_cents, "scale_out_cents": c.scale_out_cents,
+            "fee_multiplier": c.fee_multiplier, "demo": c.demo, "dry_run": c.dry_run,
+        }
+
+
+def _iso(ts: float) -> str:
+    """UTC ISO-8601 for a unix timestamp (Postgres timestamptz-friendly)."""
+    import datetime
+    return datetime.datetime.utcfromtimestamp(ts).isoformat() + "Z"
+
+
+# --------------------------------------------------------------------------- #
 # Paper-trade harness
 # --------------------------------------------------------------------------- #
 
 
 def simulate_fill_exit(pos: Position, reason: str, sell_price: int, qty: int,
                        cfg: Config, tradelog: TradeLog, run_id: str,
-                       closed_ts: float, logger: logging.Logger) -> None:
+                       closed_ts: float, logger: logging.Logger,
+                       sink: Optional["SupabaseSink"] = None) -> None:
     """Book a simulated (partial or full) exit of ``pos`` into the trade log."""
     # Allocate the entry fee to this parcel proportionally.
     parcel_entry_fee = int(round(pos.entry_fee_cents * qty / pos.contracts))
@@ -709,6 +845,9 @@ def simulate_fill_exit(pos: Position, reason: str, sell_price: int, qty: int,
         entry_fee=parcel_entry_fee, exit_fee=exit_fee,
         opened_ts=pos.opened_ts, closed_ts=closed_ts,
     )
+    if sink:
+        sink.record_trade(run_id, pos.ticker, reason, qty, pos.entry_price_cents,
+                          sell_price, parcel_entry_fee, exit_fee, pos.opened_ts, closed_ts)
     log_kv(logger, logging.INFO, "paper exit",
            reason=reason, qty=qty, entry=pos.entry_price_cents, exit=sell_price,
            exit_fee=exit_fee)
@@ -717,7 +856,8 @@ def simulate_fill_exit(pos: Position, reason: str, sell_price: int, qty: int,
 def run_paper(cfg: Config, client: KalshiClient, logger: logging.Logger,
               cycles: int, interval: float,
               book_source: Optional[Callable[[str], TopOfBook]] = None,
-              ticker: Optional[str] = None) -> dict:
+              ticker: Optional[str] = None,
+              sink: Optional["SupabaseSink"] = None) -> dict:
     """Paper-trade against the *live* order book, simulating fills locally.
 
     ``book_source(ticker) -> TopOfBook`` is injectable so the logic can be
@@ -733,6 +873,8 @@ def run_paper(cfg: Config, client: KalshiClient, logger: logging.Logger,
             log_kv(logger, logging.ERROR, "no active ticker; aborting paper run")
             return tradelog.summary(run_id)
 
+    if sink:
+        sink.start_run(run_id, "paper")
     pos: Optional[Position] = None
     log_kv(logger, logging.INFO, "paper run start",
            run_id=run_id, ticker=ticker, cycles=cycles, interval=interval)
@@ -766,7 +908,7 @@ def run_paper(cfg: Config, client: KalshiClient, logger: logging.Logger,
             if decision:
                 reason, sell_price, qty = decision
                 simulate_fill_exit(pos, reason, sell_price, qty, cfg,
-                                   tradelog, run_id, now, logger)
+                                   tradelog, run_id, now, logger, sink=sink)
                 pos.remaining -= qty
                 if reason == "scale_out":
                     pos.scaled_out = True
@@ -778,6 +920,8 @@ def run_paper(cfg: Config, client: KalshiClient, logger: logging.Logger,
 
     summary = tradelog.summary(run_id)
     tradelog.close()
+    if sink:
+        sink.end_run(run_id)
     return summary
 
 
@@ -1003,7 +1147,8 @@ def reconcile_position_from_fills(client: KalshiClient, ticker: str,
 
 
 def run_manage(cfg: Config, client: KalshiClient, signer: KalshiSigner,
-               logger: logging.Logger, cycles: Optional[int] = None) -> None:
+               logger: logging.Logger, cycles: Optional[int] = None,
+               sink: Optional["SupabaseSink"] = None, rollover: bool = False) -> None:
     """Manage a position from the WebSocket feed, falling back to REST.
 
     In LIVE mode the real position is the source of truth: it is reconciled
@@ -1014,31 +1159,66 @@ def run_manage(cfg: Config, client: KalshiClient, signer: KalshiSigner,
     In DRY_RUN / demo mode no order actually reaches the exchange, so the loop
     simulates the fill locally -- this lets you watch a full entry -> exit
     lifecycle without touching the API's order endpoint.
+
+    When ``rollover`` is true (the always-on worker), the active hourly ticker
+    is re-checked every ``cfg.rollover_check_sec`` and, when the hour rolls, the
+    loop reconnects the socket to the new market and resets local state.
     """
     live = cfg.live_orders_enabled
+    run_id = f"manage-{int(time.time())}"
+    mode = "live" if live else ("demo" if cfg.demo else "prod")
+    if sink:
+        sink.start_run(run_id, mode)
+
+    state = {"feed": None}  # mutable holder so the reconnect helper can swap it
+
+    def connect(tkr: str) -> bool:
+        old = state["feed"]
+        if old is not None:
+            old.stop()
+        f = WebSocketFeed(cfg, signer, tkr, logger)
+        ok = f.start() if signer.ready else False
+        if not ok:
+            log_kv(logger, logging.INFO, "using REST polling", ticker=tkr)
+        state["feed"] = f
+        return ok
+
     ticker = resolve_active_ticker(client, cfg.series_ticker, logger)
-    if ticker is None:
-        return
-
-    # Seed the position from real fills when we can read them (signed).
     pos: Optional[Position] = None
-    if signer.ready:
-        try:
-            pos = reconcile_position_from_fills(client, ticker, logger)
-        except Exception as exc:
-            log_kv(logger, logging.WARNING, "startup reconcile failed", error=str(exc))
-
-    feed = WebSocketFeed(cfg, signer, ticker, logger)
-    ws_ok = feed.start() if signer.ready else False
-    if not ws_ok:
-        log_kv(logger, logging.INFO, "using REST polling for management")
+    ws_ok = False
+    if ticker:
+        if signer.ready:
+            try:
+                pos = reconcile_position_from_fills(client, ticker, logger)
+            except Exception as exc:
+                log_kv(logger, logging.WARNING, "startup reconcile failed", error=str(exc))
+        ws_ok = connect(ticker)
+    elif not rollover:
+        return  # one-shot manage with no market: nothing to do
 
     grace = max(2 * cfg.poll_interval_sec, 5.0)
-    pending_until = 0.0  # do not place another order before this time (live only)
+    pending_until = 0.0        # do not place another order before this (live only)
+    last_roll_check = time.time()
     i = 0
     try:
         while cycles is None or i < cycles:
             i += 1
+
+            # --- hourly rollover: follow the active market ----------------- #
+            if rollover and (time.time() - last_roll_check) >= cfg.rollover_check_sec:
+                last_roll_check = time.time()
+                new_ticker = resolve_active_ticker(client, cfg.series_ticker, logger)
+                if new_ticker and new_ticker != ticker:
+                    log_kv(logger, logging.INFO, "ticker rollover",
+                           old=ticker, new=new_ticker)
+                    ticker, pos, pending_until = new_ticker, None, 0.0
+                    ws_ok = connect(ticker)
+
+            if ticker is None:  # forever mode, waiting for a market to open
+                time.sleep(cfg.poll_interval_sec)
+                continue
+
+            feed = state["feed"]
 
             # --- market data: prefer a fresh socket, else REST ------------- #
             if ws_ok and feed.is_fresh():
@@ -1054,12 +1234,17 @@ def run_manage(cfg: Config, client: KalshiClient, signer: KalshiSigner,
                     time.sleep(cfg.poll_interval_sec)
                     continue
 
+            if sink and top.valid:
+                sink.record_tick(ticker, top, source)
+
             # --- position truth: live reads fills every cycle -------------- #
             if live and signer.ready:
                 try:
                     pos = reconcile_position_from_fills(client, ticker, logger)
                 except Exception as exc:
                     log_kv(logger, logging.WARNING, "reconcile failed", error=str(exc))
+            if sink and pos is not None:
+                sink.record_position(run_id, ticker, pos.contracts, pos.entry_price_cents)
 
             now = time.time()
             placed = False
@@ -1068,10 +1253,15 @@ def run_manage(cfg: Config, client: KalshiClient, signer: KalshiSigner,
                 if now >= pending_until and top.valid and decide_entry(top, cfg):
                     qty = contracts_for_notional(top.yes_ask, cfg.target_notional_usd)
                     if qty > 0:
+                        coid = f"kbtc-{int(now*1000)}-{random.randint(0, 9999)}"
                         log_kv(logger, logging.INFO, "entry signal",
                                price=top.yes_ask, qty=qty, source=source)
-                        client.place_order(ticker, "yes", "buy", qty, top.yes_ask)
+                        resp = client.place_order(ticker, "yes", "buy", qty,
+                                                  top.yes_ask, client_order_id=coid)
                         placed = True
+                        if sink:
+                            sink.record_order(run_id, ticker, "yes", "buy", qty,
+                                              top.yes_ask, coid, dry_run=not live, raw=resp)
                         if not live:
                             # Simulate the fill so the lifecycle is observable.
                             fee = kalshi_fee_cents(qty, top.yes_ask, cfg)
@@ -1082,10 +1272,15 @@ def run_manage(cfg: Config, client: KalshiClient, signer: KalshiSigner,
                 decision = decide_exit(pos, top, cfg)
                 if decision and now >= pending_until:
                     reason, sell_price, qty = decision
+                    coid = f"kbtc-{int(now*1000)}-{random.randint(0, 9999)}"
                     log_kv(logger, logging.INFO, "exit signal",
                            reason=reason, price=sell_price, qty=qty, source=source)
-                    client.place_order(ticker, "yes", "sell", qty, sell_price)
+                    resp = client.place_order(ticker, "yes", "sell", qty,
+                                              sell_price, client_order_id=coid)
                     placed = True
+                    if sink:
+                        sink.record_order(run_id, ticker, "yes", "sell", qty,
+                                          sell_price, coid, dry_run=not live, raw=resp)
                     if not live:
                         pos.remaining -= qty
                         if reason == "scale_out":
@@ -1100,7 +1295,10 @@ def run_manage(cfg: Config, client: KalshiClient, signer: KalshiSigner,
 
             time.sleep(cfg.poll_interval_sec)
     finally:
-        feed.stop()
+        if state["feed"] is not None:
+            state["feed"].stop()
+        if sink:
+            sink.end_run(run_id)
 
 
 # --------------------------------------------------------------------------- #
@@ -1125,7 +1323,9 @@ def main(argv: Optional[list] = None) -> int:
     parser.add_argument("--paper", action="store_true",
                         help="paper-trade against the live book, simulate fills")
     parser.add_argument("--manage", action="store_true",
-                        help="run the WebSocket-driven management loop")
+                        help="run the WebSocket-driven management loop once")
+    parser.add_argument("--forever", action="store_true",
+                        help="always-on worker: manage + follow the hourly rollover")
     parser.add_argument("--report", action="store_true",
                         help="print the SQLite paper-trade summary and exit")
     parser.add_argument("--selftest", action="store_true",
@@ -1147,6 +1347,7 @@ def main(argv: Optional[list] = None) -> int:
     _banner(cfg, logger)
     signer = KalshiSigner(cfg)
     client = KalshiClient(cfg, signer, logger)
+    sink = SupabaseSink(cfg, logger)
     interval = args.interval if args.interval is not None else cfg.poll_interval_sec
 
     if args.report:
@@ -1156,12 +1357,19 @@ def main(argv: Optional[list] = None) -> int:
         return 0
 
     if args.paper:
-        summary = run_paper(cfg, client, logger, cycles=args.cycles, interval=interval)
+        summary = run_paper(cfg, client, logger, cycles=args.cycles,
+                            interval=interval, sink=sink)
         print_summary(summary)
         return 0
 
+    if args.forever:
+        # Always-on worker: run indefinitely, following the hourly rollover.
+        log_kv(logger, logging.INFO, "starting always-on worker (--forever)")
+        run_manage(cfg, client, signer, logger, cycles=None, sink=sink, rollover=True)
+        return 0
+
     if args.manage:
-        run_manage(cfg, client, signer, logger, cycles=args.cycles)
+        run_manage(cfg, client, signer, logger, cycles=args.cycles, sink=sink)
         return 0
 
     # Default: resolve and print the active ticker + top of book.
