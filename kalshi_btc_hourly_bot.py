@@ -710,21 +710,56 @@ def resolve_active_ticker(client: KalshiClient, series_ticker: str,
 
     quoted = [m for m in hour if _int(m.get("yes_bid")) and _int(m.get("yes_ask"))]
 
-    # The /markets LIST omits live quotes for KXBTCD, and most strikes are deep
-    # in/out-of-the-money with empty books. YES price moves monotonically with
-    # strike, so sample evenly ACROSS the strike ladder (single-market endpoint
-    # returns the live quote) to find the near-the-money strikes that are quoted.
+    # The /markets LIST omits live quotes for KXBTCD, and a single hour has 200+
+    # strikes -- most deep in/out-of-the-money with empty books. For a "BTC above
+    # $X" contract the YES ask falls monotonically as the strike rises (a higher
+    # bar is less likely), so rather than blindly sampling the whole ladder we
+    # BINARY-SEARCH it for the strike whose YES ask lands in the entry band. That
+    # homes straight in on the near-the-money strikes -- where the 85-90c action
+    # and the liquidity are -- in ~log2(strikes) probes, and never wastes probes
+    # on the deep-ITM/OTM tails (the old even-sampling could land on a dead strike
+    # $9k away from spot). Empty strikes are skipped by scanning outward to the
+    # nearest quoted neighbour, so a thin book still resolves.
+    probes = 0
     if not quoted:
         ladder = sorted((m for m in hour if _strike(m) is not None), key=_strike)
-        step = max(1, len(ladder) // 30)
-        for m in ladder[::step]:
+        lo_c = cfg.entry_min_cents if cfg else 85
+        hi_c = cfg.entry_max_cents if cfg else 90
+
+        def _probe(m):
             try:
                 mk = client.get_market(m["ticker"])
             except Exception:
-                continue
+                return None
             yb, ya = _int(mk.get("yes_bid")), _int(mk.get("yes_ask"))
-            if yb and ya:
-                quoted.append({**m, "yes_bid": yb, "yes_ask": ya})
+            return {**m, "yes_bid": yb, "yes_ask": ya} if yb and ya else None
+
+        lo, hi, seen = 0, len(ladder) - 1, set()
+        while lo <= hi and probes < 16:
+            mid = (lo + hi) // 2
+            hit = None
+            for off in range(hi - lo + 1):          # nearest quoted strike to mid
+                for j in (mid - off, mid + off):
+                    if lo <= j <= hi and j not in seen:
+                        seen.add(j)
+                        probes += 1
+                        q = _probe(ladder[j])
+                        if q is not None:
+                            hit = (j, q)
+                            break
+                if hit is not None or probes >= 16:
+                    break
+            if hit is None:
+                break
+            j, q = hit
+            quoted.append(q)
+            ask = _int(q.get("yes_ask"))
+            if lo_c <= ask <= hi_c:
+                break                                # found the money -> stop
+            if ask > hi_c:
+                lo = j + 1                           # YES too dear -> strike too low
+            else:
+                hi = j - 1                           # YES too cheap -> strike too high
 
     in_band = [m for m in quoted if _band(m)]
     if in_band:
@@ -739,7 +774,7 @@ def resolve_active_ticker(client: KalshiClient, series_ticker: str,
         # books. Log a sample and watch a real market so the loop stays healthy.
         s = max(hour, key=lambda m: _int(m.get("volume")))
         log_kv(logger, logging.WARNING, "no quoted market in ladder (thin book?)",
-               ticker=s.get("ticker"), strikes=len(hour), sampled=len(hour[::max(1, len(hour)//30)]),
+               ticker=s.get("ticker"), strikes=len(hour), probed=probes,
                status=s.get("status"))
         pick = s
 

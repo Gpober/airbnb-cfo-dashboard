@@ -334,6 +334,33 @@ def _test_market_selection(chk):
            bot.resolve_active_ticker(_Probe(), "KXBTCD", logging.getLogger("t"), cfg),
            "KXBTCD-H-T110000")
 
+    # Realistic ladder: 201 strikes, LIST omits quotes, YES ask falls
+    # monotonically with strike (a "BTC above $X" book). The binary search must
+    # home in on the 85-90c strike near spot -- WITHOUT probing all 201.
+    class _BigLadder:
+        def __init__(self):
+            self.calls = 0
+            self.strikes = [60000 + i * 100 for i in range(201)]  # 60k..80k
+
+        def get_all_markets(self, **kw):
+            return [{"ticker": f"KXBTCD-H-T{s}", "close_time": "2026-07-11T18:00:00Z",
+                     "yes_bid": 0, "yes_ask": 0} for s in self.strikes]
+
+        def get_market(self, ticker):
+            self.calls += 1
+            s = float(ticker.rsplit("-T", 1)[1])
+            i = int((s - 60000) / 100)          # ladder index 0..200
+            ask = max(1, min(99, 99 - i))        # monotonic: low strike -> dear YES
+            return {"yes_bid": ask - 2, "yes_ask": ask}
+
+    big = _BigLadder()
+    picked = bot.resolve_active_ticker(big, "KXBTCD", logging.getLogger("t"), cfg)
+    picked_strike = float(picked.rsplit("-T", 1)[1])
+    picked_ask = 99 - int((picked_strike - 60000) / 100)
+    chk.ok("binary search lands in the 85-90c band",
+           cfg.entry_min_cents <= picked_ask <= cfg.entry_max_cents)
+    chk.ok("binary search is efficient (not a full ladder scan)", big.calls < 20)
+
 
 def _test_supabase_sink(chk):
     cfg = bot.Config()
