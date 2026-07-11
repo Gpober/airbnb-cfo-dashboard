@@ -114,6 +114,11 @@ class Config:
     private_key_pem: Optional[str] = field(
         default_factory=lambda: os.getenv("KALSHI_PRIVATE_KEY_PEM")
     )
+    # base64 of the PEM file -- a single line with no special characters, so a
+    # hosting UI cannot mangle it. Preferred on Railway/Render/Fly.
+    private_key_b64: Optional[str] = field(
+        default_factory=lambda: os.getenv("KALSHI_PRIVATE_KEY_B64")
+    )
 
     # --- Market selection -------------------------------------------------- #
     series_ticker: str = field(
@@ -298,7 +303,8 @@ class KalshiSigner:
         self.cfg = cfg
         self._key = None
         self.load_error: Optional[str] = None
-        if cfg.api_key_id and (cfg.private_key_path or cfg.private_key_pem):
+        if cfg.api_key_id and (cfg.private_key_path or cfg.private_key_pem
+                               or cfg.private_key_b64):
             # A bad/mangled key must not crash the whole worker at startup --
             # record the error, stay "not ready", and let the caller log it.
             try:
@@ -309,7 +315,10 @@ class KalshiSigner:
     def _load_key(self):
         if not _HAVE_CRYPTO:
             raise RuntimeError("cryptography is required for signed requests")
-        if self.cfg.private_key_pem:
+        if self.cfg.private_key_b64:
+            # base64 of the PEM file -- decode and parse. Unmanglable on hosts.
+            pem = base64.b64decode(self.cfg.private_key_b64)
+        elif self.cfg.private_key_pem:
             pem = self._normalize_pem(self.cfg.private_key_pem).encode()
         else:
             with open(self.cfg.private_key_path, "rb") as fh:  # type: ignore[arg-type]
@@ -320,23 +329,23 @@ class KalshiSigner:
     def _normalize_pem(s: str) -> str:
         """Repair a PEM that a hosting UI mangled.
 
-        Env-var editors frequently strip real newlines or store them as the
-        literal two characters ``\\n``. A PEM without line breaks is invalid, so
-        we undo the common manglings before parsing.
+        Env-var editors frequently strip real newlines, replace them with
+        spaces, store them as the literal two characters ``\\n``, or jam the
+        BEGIN/END markers onto the key body. A PEM without proper line breaks is
+        invalid, so we rebuild it from the base64 body before parsing.
         """
+        import re
         s = s.strip().strip('"').strip("'")
-        if "\\n" in s and "\n" not in s:          # literal backslash-n -> newline
+        if "\\n" in s:                       # literal backslash-n -> newline
             s = s.replace("\\n", "\n")
-        if "\n" not in s and "-----BEGIN" in s:   # all on one line -> rebuild
-            body = s.replace("-----BEGIN RSA PRIVATE KEY-----", "") \
-                    .replace("-----END RSA PRIVATE KEY-----", "") \
-                    .replace("-----BEGIN PRIVATE KEY-----", "") \
-                    .replace("-----END PRIVATE KEY-----", "").strip()
-            header = "-----BEGIN RSA PRIVATE KEY-----" if "RSA PRIVATE" in s \
-                else "-----BEGIN PRIVATE KEY-----"
-            footer = header.replace("BEGIN", "END")
+        # If the markers are present but the body is not correctly wrapped
+        # (no interior newlines, or the header/footer are jammed on), rebuild.
+        m = re.search(r"-----BEGIN ([A-Z0-9 ]+?)-----(.*?)-----END \1-----", s, re.DOTALL)
+        if m:
+            label = m.group(1).strip()
+            body = "".join(m.group(2).split())  # strip ALL whitespace from body
             wrapped = "\n".join(body[i:i + 64] for i in range(0, len(body), 64))
-            s = f"{header}\n{wrapped}\n{footer}"
+            s = f"-----BEGIN {label}-----\n{wrapped}\n-----END {label}-----\n"
         return s
 
     @property

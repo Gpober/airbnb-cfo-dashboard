@@ -290,15 +290,25 @@ def _test_pem_normalize(chk):
         serialization.NoEncryption(),
     ).decode()
 
-    # Case 1: real newlines replaced by the literal two chars backslash-n.
-    mangled = pem.replace("\n", "\\n")
-    cfg = bot.Config()
-    cfg.api_key_id = "kid"
-    cfg.private_key_pem = mangled
-    s1 = bot.KalshiSigner(cfg)
-    chk.ok("literal \\n PEM repaired + ready", s1.ready and not s1.load_error)
+    def _ready(pem_or=None, b64=None):
+        c = bot.Config()
+        c.api_key_id = "kid"
+        c.private_key_pem = pem_or
+        c.private_key_b64 = b64
+        s = bot.KalshiSigner(c)
+        return s.ready and not s.load_error
 
-    # Case 2: a bad key sets load_error but does NOT raise (no crash).
+    # Case 1: real newlines replaced by the literal two chars backslash-n.
+    chk.ok("literal \\n PEM repaired", _ready(pem.replace("\n", "\\n")))
+    # Case 2: newlines replaced by spaces AND header/footer jammed on (Railway).
+    chk.ok("space-mangled PEM repaired", _ready(pem.replace("\n", " ")))
+    # Case 3: everything jammed onto a single line, no separators at all.
+    chk.ok("fully-jammed PEM repaired", _ready(pem.replace("\n", "")))
+    # Case 4: base64 of the PEM file (the unmanglable path).
+    import base64 as _b64
+    chk.ok("base64 key path works", _ready(b64=_b64.b64encode(pem.encode()).decode()))
+
+    # Case 5: a bad key sets load_error but does NOT raise (no crash).
     cfg2 = bot.Config()
     cfg2.api_key_id = "kid"
     cfg2.private_key_pem = "-----BEGIN RSA PRIVATE KEY-----\nnot-a-real-key\n-----END RSA PRIVATE KEY-----"

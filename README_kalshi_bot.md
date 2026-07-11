@@ -85,8 +85,9 @@ Sources (verified July 2026):
 | `KALSHI_DEMO` | `true` | Use demo API. **Must be `false` for live.** |
 | `KALSHI_DRY_RUN` | `true` | Never send orders. **Must be `false` for live.** |
 | `KALSHI_API_KEY_ID` | — | Kalshi API key id (access key). |
-| `KALSHI_PRIVATE_KEY_PATH` | — | Path to the RSA private key PEM. |
-| `KALSHI_PRIVATE_KEY_PEM` | — | PEM contents (alternative to the path). |
+| `KALSHI_PRIVATE_KEY_PATH` | — | Path to the RSA private key PEM (local/dev). |
+| `KALSHI_PRIVATE_KEY_PEM` | — | PEM contents (bot auto-repairs mangled newlines). |
+| `KALSHI_PRIVATE_KEY_B64` | — | **base64 of the PEM** — one unmanglable line. Preferred on Railway/Render/Fly. |
 | `KALSHI_SERIES_TICKER` | `KXBTCD` | Series to trade. |
 | `KALSHI_ENTRY_MIN_CENTS` | `85` | Entry band low (YES ask). |
 | `KALSHI_ENTRY_MAX_CENTS` | `90` | Entry band high (YES ask). |
@@ -107,9 +108,18 @@ Sources (verified July 2026):
 | `SUPABASE_URL` | — | Supabase project URL. Enables the Supabase mirror when set with the key below. |
 | `SUPABASE_SERVICE_ROLE_KEY` | — | Supabase **service-role** key (server-side only). Writes bypass RLS. |
 
-> On a filesystem-less host (or when you'd rather not mount a file), pass the
-> key inline via `KALSHI_PRIVATE_KEY_PEM` (the full PEM text) instead of
-> `KALSHI_PRIVATE_KEY_PATH`.
+> **On a hosting platform, prefer `KALSHI_PRIVATE_KEY_B64`.** Env-var editors
+> often collapse a multiline PEM's newlines (or turn them into spaces / literal
+> `\n`), which corrupts the key. base64 is a single line with no special
+> characters, so it survives intact:
+>
+> ```bash
+> base64 -w0 kalshi_private_key.pem   # Linux
+> base64 -i kalshi_private_key.pem    # macOS
+> ```
+>
+> Paste the output as `KALSHI_PRIVATE_KEY_B64`. (The bot also auto-repairs a
+> mangled `KALSHI_PRIVATE_KEY_PEM`, but base64 avoids the problem entirely.)
 
 ## Deployment (always-on worker + dashboard)
 
