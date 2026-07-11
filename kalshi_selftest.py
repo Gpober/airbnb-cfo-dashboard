@@ -152,8 +152,9 @@ def _test_manage_dryrun(chk):
     state = {"i": 0}
 
     class _Stub:
-        def get_markets(self, **kw):
-            return {"markets": [{"ticker": "KXBTCD-T", "close_time": "2026-07-10T20:00:00Z"}]}
+        def get_all_markets(self, **kw):
+            return [{"ticker": "KXBTCD-T", "close_time": "2026-07-10T20:00:00Z",
+                     "yes_bid": 86, "yes_ask": 87, "volume": 100}]
 
         def get_top(self, ticker):
             b = books[min(state["i"], len(books) - 1)]
@@ -226,6 +227,39 @@ def _test_paper_harness(chk, cfg):
     chk.ok("paper positive net P&L", summary.get("total_net_pnl_cents", 0) > 0)
     # Entry 87c -> exit 99c on ~11 contracts nets ~ (99-87)*11 - fees > 0.
     chk.ok("paper expectancy computed", "net_expectancy_per_1000_cents" in summary)
+
+
+def _test_market_selection(chk):
+    cfg = bot.Config()  # entry band 85-90
+
+    class _Ladder:
+        def get_all_markets(self, **kw):
+            return [
+                # current hour (soonest close): empty strike, in-band strike, liquid off-band strike
+                {"ticker": "KX-A-T1", "close_time": "2026-07-11T18:00:00Z", "yes_bid": 0,  "yes_ask": 0,  "volume": 0},
+                {"ticker": "KX-A-T2", "close_time": "2026-07-11T18:00:00Z", "yes_bid": 86, "yes_ask": 88, "volume": 500},
+                {"ticker": "KX-A-T3", "close_time": "2026-07-11T18:00:00Z", "yes_bid": 40, "yes_ask": 42, "volume": 9000},
+                # later hour, in-band + high volume, but must be ignored (not soonest)
+                {"ticker": "KX-B-T2", "close_time": "2026-07-11T19:00:00Z", "yes_bid": 87, "yes_ask": 89, "volume": 99999},
+            ]
+    t = bot.resolve_active_ticker(_Ladder(), "KXBTCD", logging.getLogger("t"), cfg)
+    chk.eq("picks in-band strike in current hour", t, "KX-A-T2")
+
+    class _NoBand:
+        def get_all_markets(self, **kw):
+            return [
+                {"ticker": "E1", "close_time": "2026-07-11T18:00:00Z", "yes_bid": 0,  "yes_ask": 0,  "volume": 0},
+                {"ticker": "E2", "close_time": "2026-07-11T18:00:00Z", "yes_bid": 40, "yes_ask": 42, "volume": 100},
+                {"ticker": "E3", "close_time": "2026-07-11T18:00:00Z", "yes_bid": 55, "yes_ask": 57, "volume": 9000},
+            ]
+    chk.eq("no in-band -> most liquid quoted",
+           bot.resolve_active_ticker(_NoBand(), "KXBTCD", logging.getLogger("t"), cfg), "E3")
+
+    class _Empty:
+        def get_all_markets(self, **kw):
+            return []
+    chk.ok("no markets -> None",
+           bot.resolve_active_ticker(_Empty(), "KXBTCD", logging.getLogger("t"), cfg) is None)
 
 
 def _test_supabase_sink(chk):
@@ -371,6 +405,7 @@ def run_selftests(cfg=None, logger=None) -> int:
     _test_ws_desync(chk, cfg)
     _test_manage_dryrun(chk)
     _test_supabase_sink(chk)
+    _test_market_selection(chk)
     _test_pem_normalize(chk)
     _test_reconcile(chk, cfg)
     _test_paper_harness(chk, cfg)

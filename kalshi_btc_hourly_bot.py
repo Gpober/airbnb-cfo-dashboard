@@ -524,6 +524,26 @@ class KalshiClient:
         path = "/markets" + (f"?{query}" if query else "")
         return self._request("GET", path, signed=False)
 
+    def get_all_markets(self, max_pages: int = 10, **params) -> list:
+        """Fetch markets across pages (KXBTCD is a large strike ladder).
+
+        Follows the cursor so we see every strike, not just the first page --
+        otherwise market selection can miss the liquid, in-band contract.
+        """
+        out: list = []
+        cursor: Optional[str] = None
+        for _ in range(max_pages):
+            page = dict(params)
+            page["limit"] = 1000
+            if cursor:
+                page["cursor"] = cursor
+            data = self.get_markets(**page)
+            out.extend(data.get("markets", []))
+            cursor = data.get("cursor")
+            if not cursor:
+                break
+        return out
+
     def get_orderbook(self, ticker: str, depth: int = 1) -> dict:
         path = f"/markets/{ticker}/orderbook?depth={depth}"
         data = self._request("GET", path, signed=False)
@@ -604,29 +624,59 @@ class KalshiClient:
 
 
 def resolve_active_ticker(client: KalshiClient, series_ticker: str,
-                          logger: logging.Logger) -> Optional[str]:
-    """Find the current, open, soonest-closing market in ``series_ticker``.
+                          logger: logging.Logger,
+                          cfg: Optional[Config] = None) -> Optional[str]:
+    """Select the tradeable market in ``series_ticker`` for this hour.
 
-    Confirms the live ticker via ``GET /markets`` rather than trusting a
-    hard-coded value (hourly markets rotate). Returns None on any error so
-    callers degrade gracefully instead of crashing.
+    KXBTCD is a *strike ladder*: each hour has many strike markets, and most
+    are illiquid with empty books. Picking the first by close-time (the old
+    behaviour) lands on a dead strike. Instead, within the soonest-closing
+    hour, use the quotes Kalshi returns in ``GET /markets`` to pick a market
+    that is actually trading -- preferring one whose YES ask is inside the
+    entry band, else the most liquid quoted strike. Returns None on error so
+    callers degrade gracefully.
     """
     try:
-        data = client.get_markets(series_ticker=series_ticker, status="open", limit=200)
+        markets = client.get_all_markets(series_ticker=series_ticker, status="open")
     except Exception as exc:
         log_kv(logger, logging.ERROR, "market lookup failed",
                series=series_ticker, error=str(exc))
         return None
-    markets = data.get("markets", [])
     if not markets:
         log_kv(logger, logging.WARNING, "no open markets", series=series_ticker)
         return None
-    # Soonest close = the currently active hourly contract.
-    markets.sort(key=lambda m: m.get("close_time", ""))
-    ticker = markets[0]["ticker"]
-    log_kv(logger, logging.INFO, "resolved active ticker",
-           series=series_ticker, ticker=ticker, open_markets=len(markets))
-    return ticker
+
+    # Restrict to the currently-active hour (soonest close time).
+    soonest = min((m.get("close_time", "") for m in markets if m.get("close_time")),
+                  default="")
+    hour = [m for m in markets if m.get("close_time", "") == soonest] or markets
+
+    # Markets with a real two-sided quote (yes_bid and yes_ask are cents; 0/None
+    # means no quote). These are the only ones worth watching or trading.
+    def _int(v):
+        try:
+            return int(v)
+        except (TypeError, ValueError):
+            return 0
+
+    quoted = [m for m in hour if _int(m.get("yes_bid")) and _int(m.get("yes_ask"))]
+
+    in_band = []
+    if cfg is not None:
+        in_band = [m for m in quoted
+                   if cfg.entry_min_cents <= _int(m.get("yes_ask")) <= cfg.entry_max_cents]
+
+    pool = in_band or quoted
+    if not pool:
+        log_kv(logger, logging.WARNING, "no quoted market this hour; watching most active",
+               series=series_ticker, hour_markets=len(hour))
+        pool = hour  # nothing quoted -- fall back so we still watch a real market
+
+    pick = max(pool, key=lambda m: _int(m.get("volume")))
+    log_kv(logger, logging.INFO, "selected market", ticker=pick["ticker"],
+           yes_bid=pick.get("yes_bid"), yes_ask=pick.get("yes_ask"),
+           in_band=bool(in_band), quoted=len(quoted), open_markets=len(markets))
+    return pick["ticker"]
 
 
 # --------------------------------------------------------------------------- #
@@ -932,7 +982,7 @@ def run_paper(cfg: Config, client: KalshiClient, logger: logging.Logger,
     get_top = book_source or client.get_top
 
     if ticker is None:
-        ticker = resolve_active_ticker(client, cfg.series_ticker, logger)
+        ticker = resolve_active_ticker(client, cfg.series_ticker, logger, cfg)
         if ticker is None:
             log_kv(logger, logging.ERROR, "no active ticker; aborting paper run")
             return tradelog.summary(run_id)
@@ -1247,7 +1297,7 @@ def run_manage(cfg: Config, client: KalshiClient, signer: KalshiSigner,
         state["feed"] = f
         return ok
 
-    ticker = resolve_active_ticker(client, cfg.series_ticker, logger)
+    ticker = resolve_active_ticker(client, cfg.series_ticker, logger, cfg)
     pos: Optional[Position] = None
     ws_ok = False
     if ticker:
@@ -1271,7 +1321,7 @@ def run_manage(cfg: Config, client: KalshiClient, signer: KalshiSigner,
             # --- hourly rollover: follow the active market ----------------- #
             if rollover and (time.time() - last_roll_check) >= cfg.rollover_check_sec:
                 last_roll_check = time.time()
-                new_ticker = resolve_active_ticker(client, cfg.series_ticker, logger)
+                new_ticker = resolve_active_ticker(client, cfg.series_ticker, logger, cfg)
                 if new_ticker and new_ticker != ticker:
                     log_kv(logger, logging.INFO, "ticker rollover",
                            old=ticker, new=new_ticker)
@@ -1454,7 +1504,7 @@ def main(argv: Optional[list] = None) -> int:
         return 0
 
     # Default: resolve and print the active ticker + top of book.
-    ticker = resolve_active_ticker(client, cfg.series_ticker, logger)
+    ticker = resolve_active_ticker(client, cfg.series_ticker, logger, cfg)
     if ticker:
         try:
             top = client.get_top(ticker)
