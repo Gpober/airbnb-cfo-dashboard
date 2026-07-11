@@ -565,6 +565,76 @@ def _test_performance_memory(chk):
     chk.ok("snapshot present when enabled", m2.snapshot_block() is not None)
 
 
+def _test_remote_settings(chk):
+    import remote_settings as rs
+    from types import SimpleNamespace as NS
+
+    # Whitelisted knobs apply and clamp; junk is dropped.
+    cfg = bot.Config()
+    changes, paused = rs.apply_settings(cfg, {"target_notional_usd": 8})
+    chk.eq("target notional applied", cfg.target_notional_usd, 8.0)
+    chk.ok("change reported", any("target_notional_usd" in c for c in changes))
+
+    cfg = bot.Config()
+    rs.apply_settings(cfg, {"target_notional_usd": -5})
+    chk.eq("non-positive size rejected", cfg.target_notional_usd, 1000.0)  # unchanged default
+
+    # SAFETY: demo/dry_run are NEVER remote-adjustable.
+    cfg = bot.Config()
+    cfg.demo = True
+    cfg.dry_run = True
+    rs.apply_settings(cfg, {"demo": False, "dry_run": False, "target_notional_usd": 12})
+    chk.ok("demo not remote-adjustable", cfg.demo is True)
+    chk.ok("dry_run not remote-adjustable", cfg.dry_run is True)
+    chk.eq("size still applied alongside ignored flags", cfg.target_notional_usd, 12.0)
+
+    # Entry band: valid pair applies; inverted pair is ignored wholesale.
+    cfg = bot.Config()
+    rs.apply_settings(cfg, {"entry_min_cents": 80, "entry_max_cents": 92})
+    chk.eq("band min applied", cfg.entry_min_cents, 80)
+    chk.eq("band max applied", cfg.entry_max_cents, 92)
+    cfg = bot.Config()  # defaults 85/90
+    rs.apply_settings(cfg, {"entry_min_cents": 95, "entry_max_cents": 70})
+    chk.eq("inverted band ignored (min)", cfg.entry_min_cents, 85)
+    chk.eq("inverted band ignored (max)", cfg.entry_max_cents, 90)
+
+    # Clamping into legal cent ranges (max=150 -> 99; band 85..99 stays valid).
+    cfg = bot.Config()
+    rs.apply_settings(cfg, {"entry_max_cents": 150})
+    chk.eq("cent value clamped to <=99", cfg.entry_max_cents, 99)
+
+    # Pause flag is surfaced, not written onto cfg.
+    cfg = bot.Config()
+    _, paused = rs.apply_settings(cfg, {"entries_paused": True})
+    chk.ok("pause flag surfaced", paused is True)
+
+    # Disabled wrapper (no sink) is inert.
+    m = rs.RemoteSettings(bot.Config(), logging.getLogger("t"), sink=None)
+    chk.ok("remote settings off without sink", not m.enabled)
+    chk.ok("disabled not paused", m.paused is False)
+
+    # Enabled wrapper with a stub sink applies a fetched size + pause.
+    cfg = bot.Config()
+
+    class _Resp:
+        status_code = 200
+        text = ""
+        def json(self):
+            return [{"key": "target_notional_usd", "value": 8},
+                    {"key": "entries_paused", "value": True}]
+
+    class _Sess:
+        def get(self, *a, **k):
+            return _Resp()
+
+    stub_sink = NS(enabled=True, _base="http://x/rest/v1", _session=_Sess())
+    r = rs.RemoteSettings(cfg, logging.getLogger("t"), sink=stub_sink)
+    chk.ok("remote settings enabled with sink", r.enabled)
+    r.refresh(1000.0)
+    chk.eq("fetched size applied to cfg", cfg.target_notional_usd, 8.0)
+    chk.ok("fetched pause applied", r.paused is True)
+
+
 def _test_signing(chk):
     """Generate an ephemeral RSA key, sign, and verify RSA-PSS/SHA-256."""
     if not bot._HAVE_CRYPTO:
@@ -623,6 +693,7 @@ def run_selftests(cfg=None, logger=None) -> int:
     _test_get_top_from_market(chk)
     _test_ai_layer(chk)
     _test_performance_memory(chk)
+    _test_remote_settings(chk)
     _test_sign_strips_query(chk)
     _test_pem_normalize(chk)
     _test_reconcile(chk, cfg)

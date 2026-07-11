@@ -109,6 +109,33 @@ export async function getAiDecisions(limit = 15): Promise<AiDecision[]> {
   );
 }
 
+export type Settings = {
+  target_notional_usd: number;
+  entries_paused: boolean;
+  entry_min_cents?: number;
+  entry_max_cents?: number;
+  updated?: string | null;
+};
+
+export async function getSettings(): Promise<Settings> {
+  const rows = await rest<{ key: string; value: any; updated_at: string }>(
+    "kalshi_settings?select=key,value,updated_at",
+  );
+  const map = new Map(rows.map((r) => [r.key, r]));
+  const num = (k: string, d: number) => {
+    const v = map.get(k)?.value;
+    return typeof v === "number" ? v : Number(v ?? d);
+  };
+  const updated = rows.map((r) => r.updated_at).sort().at(-1) ?? null;
+  return {
+    target_notional_usd: num("target_notional_usd", 8),
+    entries_paused: map.get("entries_paused")?.value === true,
+    entry_min_cents: map.has("entry_min_cents") ? num("entry_min_cents", 85) : undefined,
+    entry_max_cents: map.has("entry_max_cents") ? num("entry_max_cents", 90) : undefined,
+    updated,
+  };
+}
+
 // -- derived stats ---------------------------------------------------------- //
 
 export type Stats = {

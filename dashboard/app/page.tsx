@@ -1,7 +1,8 @@
 import AutoRefresh from "@/components/AutoRefresh";
+import Controls from "@/components/Controls";
 import {
   configured, getLatestRun, getTrades, getLatestTick, getLatestPosition,
-  getAiDecisions, computeStats, modeLabel, dollars, pct, type Trade,
+  getAiDecisions, getSettings, computeStats, modeLabel, dollars, pct, type Trade,
 } from "@/lib/data";
 
 export const dynamic = "force-dynamic"; // always render fresh from Supabase
@@ -63,8 +64,9 @@ export default async function Page() {
     );
   }
 
-  const [run, trades, tick, position, ai] = await Promise.all([
+  const [run, trades, tick, position, ai, settings] = await Promise.all([
     getLatestRun(), getTrades(), getLatestTick(), getLatestPosition(), getAiDecisions(),
+    getSettings(),
   ]);
   const stats = computeStats(trades);
   const mode = modeLabel(run);
@@ -95,10 +97,18 @@ export default async function Page() {
           {tick ? `${tick.ticker} — bid ${tick.yes_bid ?? "—"}¢ / ask ${tick.yes_ask ?? "—"}¢` : "waiting for first market tick"}
           {position && position.net_contracts !== 0 &&
             ` · open: ${position.net_contracts} @ ${position.avg_entry}¢`}
+          {settings.entries_paused && " · ⏸ entries paused"}
         </span>
       </div>
 
-      <div className="grid">
+      <div className="section-title">Controls</div>
+      <Controls
+        target={settings.target_notional_usd}
+        paused={settings.entries_paused}
+        updated={settings.updated ?? null}
+      />
+
+      <div className="grid" style={{ marginTop: 20 }}>
         <Kpi label="Trades" value={String(stats.trades)} sub={stats.trades ? `${stats.wins} wins` : "none yet"} />
         <Kpi label="Win rate" value={pct(stats.winRate)} />
         <Kpi

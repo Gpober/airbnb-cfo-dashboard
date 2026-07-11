@@ -64,6 +64,7 @@ import requests
 
 from ai_strategy import AIStrategy, ai_early_exit, gate_entry  # optional AI layer
 from performance_memory import PerformanceMemory  # optional learning layer
+from remote_settings import RemoteSettings  # dashboard-adjustable safe controls
 
 try:  # cryptography is required for real auth; keep import errors friendly.
     from cryptography.hazmat.primitives import hashes, serialization
@@ -211,6 +212,17 @@ class Config:
     # Min trades in an entry-price bucket before its (bad) stats can veto it.
     learn_bucket_min_trades: int = field(
         default_factory=lambda: _env_int("KALSHI_LEARN_BUCKET_MIN_TRADES", 8)
+    )
+
+    # --- Remote controls (polled from Supabase kalshi_settings) ----------- #
+    # Lets the dashboard adjust SAFE knobs (size, band, stop/take, entry pause)
+    # live, without a redeploy. The real-money gate (demo/dry_run) is NEVER
+    # remote-adjustable. On by default wherever Supabase is configured.
+    remote_settings_enabled: bool = field(
+        default_factory=lambda: _env_bool("KALSHI_REMOTE_SETTINGS_ENABLED", True)
+    )
+    settings_refresh_sec: float = field(
+        default_factory=lambda: _env_float("KALSHI_SETTINGS_REFRESH_SEC", 30.0)
     )
 
     # --- Supabase sink (optional) ----------------------------------------- #
@@ -1452,7 +1464,8 @@ def run_manage(cfg: Config, client: KalshiClient, signer: KalshiSigner,
                logger: logging.Logger, cycles: Optional[int] = None,
                sink: Optional["SupabaseSink"] = None, rollover: bool = False,
                ai: Optional["AIStrategy"] = None,
-               mem: Optional["PerformanceMemory"] = None) -> None:
+               mem: Optional["PerformanceMemory"] = None,
+               controls: Optional["RemoteSettings"] = None) -> None:
     """Manage a position from the WebSocket feed, falling back to REST.
 
     In LIVE mode the real position is the source of truth: it is reconciled
@@ -1506,6 +1519,8 @@ def run_manage(cfg: Config, client: KalshiClient, signer: KalshiSigner,
     last_ai_ts = 0.0           # throttle AI exit checks (cfg.ai_min_interval_sec)
     if mem is not None:
         mem.refresh(time.time())   # prime performance history before trading
+    if controls is not None:
+        controls.refresh(time.time())   # apply dashboard settings before trading
     i = 0
     try:
         while cycles is None or i < cycles:
@@ -1567,13 +1582,19 @@ def run_manage(cfg: Config, client: KalshiClient, signer: KalshiSigner,
                 sink.record_position(run_id, ticker, pos.contracts, pos.entry_price_cents)
 
             now = time.time()
+            if controls is not None:
+                controls.maybe_refresh(now)
             if mem is not None:
                 mem.maybe_refresh(now)
             hist = mem.snapshot_block() if mem is not None else None
             placed = False
 
             if pos is None:
-                if now >= pending_until and top.valid and decide_entry(top, cfg):
+                if (controls is not None and controls.paused and now >= pending_until
+                        and top.valid and decide_entry(top, cfg)):
+                    log_kv(logger, logging.INFO, "entry paused remotely (dashboard)",
+                           ticker=ticker)
+                elif now >= pending_until and top.valid and decide_entry(top, cfg):
                     qty = contracts_for_notional(top.yes_ask, cfg.target_notional_usd)
                     why = "rule:enter"
                     # Learning overlay: from realized history, pause after a losing
@@ -1723,6 +1744,7 @@ def main(argv: Optional[list] = None) -> int:
     sink = SupabaseSink(cfg, logger)
     ai = AIStrategy(cfg, logger)
     mem = PerformanceMemory(cfg, logger, sink)
+    controls = RemoteSettings(cfg, logger, sink)
     interval = args.interval if args.interval is not None else cfg.poll_interval_sec
 
     if args.report:
@@ -1741,12 +1763,12 @@ def main(argv: Optional[list] = None) -> int:
         # Always-on worker: run indefinitely, following the hourly rollover.
         log_kv(logger, logging.INFO, "starting always-on worker (--forever)")
         run_manage(cfg, client, signer, logger, cycles=None, sink=sink,
-                   rollover=True, ai=ai, mem=mem)
+                   rollover=True, ai=ai, mem=mem, controls=controls)
         return 0
 
     if args.manage:
         run_manage(cfg, client, signer, logger, cycles=args.cycles, sink=sink,
-                   ai=ai, mem=mem)
+                   ai=ai, mem=mem, controls=controls)
         return 0
 
     # Default: resolve and print the active ticker + top of book.

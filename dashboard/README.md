@@ -38,6 +38,11 @@ npm run dev                  # http://localhost:3000
 
 ## What it shows
 
+- **Controls** — adjust **trade size ($/entry)** and **pause/resume new entries**
+  live. Writes go through a server route (`/api/settings`) that uses the
+  service-role key on the server and only accepts a whitelist of safe keys; the
+  worker picks up changes within ~30s. The real-money gate (`DEMO`/`DRY_RUN`)
+  is **not** adjustable here — it stays env-only on Railway.
 - **Status pill** — whether the live market feed is fresh (a tick in the last 2 min).
 - **Mode banner** — LIVE real-money vs. dry-run/demo/paper, plus the current
   market's bid/ask and any open position.
