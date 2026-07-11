@@ -1267,13 +1267,16 @@ def run_manage(cfg: Config, client: KalshiClient, signer: KalshiSigner,
                 continue
 
             feed = state["feed"]
+            # Roughly one heartbeat / stale-notice per rollover window.
+            hb_every = max(1, int(cfg.rollover_check_sec / max(cfg.poll_interval_sec, 1)))
 
             # --- market data: prefer a fresh socket, else REST ------------- #
             if ws_ok and feed.is_fresh():
                 top, source = feed.top, "ws"
             else:
-                if ws_ok and not feed.is_fresh():
-                    log_kv(logger, logging.WARNING, "ws stale; REST fallback this cycle")
+                # Throttle so a persistently-unusable socket doesn't log every cycle.
+                if ws_ok and not feed.is_fresh() and i % hb_every == 1:
+                    log_kv(logger, logging.WARNING, "ws not fresh; using REST", ticker=ticker)
                 try:
                     top = client.get_top(ticker)
                     source = "rest"
@@ -1281,6 +1284,16 @@ def run_manage(cfg: Config, client: KalshiClient, signer: KalshiSigner,
                     log_kv(logger, logging.WARNING, "REST top failed", error=str(exc))
                     time.sleep(cfg.poll_interval_sec)
                     continue
+
+            # Heartbeat: log exactly what the bot sees ~once per minute so a
+            # quiet loop is diagnosable (empty book vs. no signal vs. all good).
+            if i % hb_every == 0:
+                log_kv(logger, logging.INFO, "heartbeat", ticker=ticker,
+                       yes_bid=top.yes_bid, yes_ask=top.yes_ask, valid=top.valid,
+                       source=source, has_position=pos is not None)
+            if not top.valid and i % hb_every == 1:
+                log_kv(logger, logging.WARNING, "order book empty/one-sided; skipping",
+                       ticker=ticker, yes_bid=top.yes_bid, yes_ask=top.yes_ask)
 
             if sink and top.valid:
                 sink.record_tick(ticker, top, source)
