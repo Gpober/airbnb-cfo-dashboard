@@ -226,6 +226,22 @@ class _JsonFormatter(logging.Formatter):
         return json.dumps(payload, default=str)
 
 
+class _ConsoleFormatter(logging.Formatter):
+    """Human-readable console line that also appends the structured kv fields.
+
+    Without this, `log_kv(..., ticker=..., yes_bid=...)` would print only the
+    bare message on the console (and hosts like Railway only show the console),
+    hiding the very fields we log for diagnosis. Append them as k=v pairs.
+    """
+
+    def format(self, record: logging.LogRecord) -> str:
+        base = super().format(record)
+        kv = getattr(record, "kv", None)
+        if isinstance(kv, dict) and kv:
+            base += " " + " ".join(f"{k}={v}" for k, v in kv.items())
+        return base
+
+
 def setup_logging(cfg: Config, verbose: bool = False) -> logging.Logger:
     logger = logging.getLogger("kalshi_btc")
     logger.setLevel(logging.DEBUG if verbose else logging.INFO)
@@ -238,9 +254,9 @@ def setup_logging(cfg: Config, verbose: bool = False) -> logging.Logger:
     fh.setFormatter(_JsonFormatter())
     logger.addHandler(fh)
 
-    # Human-readable console log.
+    # Human-readable console log (includes kv fields so hosted logs show them).
     ch = logging.StreamHandler(sys.stdout)
-    ch.setFormatter(logging.Formatter("%(asctime)s %(levelname)-5s %(message)s"))
+    ch.setFormatter(_ConsoleFormatter("%(asctime)s %(levelname)-5s %(message)s"))
     logger.addHandler(ch)
     logger.propagate = False
     return logger
