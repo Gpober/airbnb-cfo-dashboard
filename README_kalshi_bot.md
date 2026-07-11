@@ -114,6 +114,32 @@ Sources (verified July 2026):
 | `KALSHI_AI_MODEL` | `claude-opus-4-8` | Anthropic model id for the decision layer. |
 | `KALSHI_AI_MIN_INTERVAL_SEC` | `30` | Min seconds between AI exit checks (cost control). |
 | `ANTHROPIC_API_KEY` | — | Anthropic API key. Required only if `KALSHI_AI_ENABLED=true`. |
+| `KALSHI_LEARN_ENABLED` | `false` | Turn the optional performance-learning layer on (needs Supabase). |
+| `KALSHI_LEARN_MIN_TRADES` | `20` | Closed trades required before learning adapts (cold-start guard). |
+| `KALSHI_LEARN_LOOKBACK` | `200` | Most-recent trades considered. |
+| `KALSHI_LEARN_REFRESH_SEC` | `300` | Seconds between history refreshes. |
+| `KALSHI_LEARN_MIN_SCALAR` | `0.5` | Floor on the size multiplier (learning may cut size to this fraction, never below). |
+| `KALSHI_LEARN_PAUSE_LOSS_STREAK` | `5` | Consecutive losers that pause new entries. |
+| `KALSHI_LEARN_BUCKET_MIN_TRADES` | `8` | Trades in an entry-price bucket before its stats can veto it. |
+| `KALSHI_REMOTE_SETTINGS_ENABLED` | `true` | Poll `kalshi_settings` for dashboard-adjustable controls (needs Supabase). |
+| `KALSHI_SETTINGS_REFRESH_SEC` | `30` | Seconds between remote-settings polls. |
+
+### Remote controls (dashboard-adjustable)
+
+When Supabase is configured, the worker polls a `kalshi_settings` table every
+`KALSHI_SETTINGS_REFRESH_SEC` and applies a **whitelist** of safe knobs live —
+no redeploy needed. This is how the dashboard adjusts the bot:
+
+| Setting key | Meaning |
+|-------------|---------|
+| `target_notional_usd` | Dollars per entry (overrides `KALSHI_TARGET_NOTIONAL_USD`). |
+| `entries_paused` | `true` stops new entries; open positions still exit. |
+| `entry_min_cents` / `entry_max_cents` | Entry band (validated so min ≤ max). |
+| `stop_loss_cents` / `take_profit_cents` | Exit thresholds. |
+
+A stored value **overrides** the matching env default. **Safety:** `KALSHI_DEMO`
+and `KALSHI_DRY_RUN` are *never* in this whitelist — the real-money gate stays
+environment-only, so no web form can move the bot to live trading.
 
 > **On a hosting platform, prefer `KALSHI_PRIVATE_KEY_B64`.** Env-var editors
 > often collapse a multiline PEM's newlines (or turn them into spaces / literal
