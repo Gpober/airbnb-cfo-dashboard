@@ -683,17 +683,40 @@ def resolve_active_ticker(client: KalshiClient, series_ticker: str,
         except (TypeError, ValueError):
             return 0
 
+    def _band(m):
+        return cfg is not None and cfg.entry_min_cents <= _int(m.get("yes_ask")) <= cfg.entry_max_cents
+
     quoted = [m for m in hour if _int(m.get("yes_bid")) and _int(m.get("yes_ask"))]
 
-    in_band = []
-    if cfg is not None:
-        in_band = [m for m in quoted
-                   if cfg.entry_min_cents <= _int(m.get("yes_ask")) <= cfg.entry_max_cents]
+    # The /markets LIST often omits live quotes even when authenticated. If so,
+    # probe the most active strikes directly -- the single-market endpoint
+    # returns the live quote -- and stop as soon as we find an in-band one.
+    if not quoted:
+        cands = sorted(hour, key=lambda m: _int(m.get("open_interest")) + _int(m.get("volume")),
+                       reverse=True)[:15]
+        for m in cands:
+            try:
+                mk = client.get_market(m["ticker"])
+            except Exception:
+                continue
+            yb, ya = _int(mk.get("yes_bid")), _int(mk.get("yes_ask"))
+            if yb and ya:
+                m = {**m, "yes_bid": yb, "yes_ask": ya}
+                quoted.append(m)
+                if _band(m):
+                    break
 
+    in_band = [m for m in quoted if _band(m)]
     pool = in_band or quoted
     if not pool:
-        log_kv(logger, logging.WARNING, "no quoted market this hour; watching most active",
-               series=series_ticker, hour_markets=len(hour))
+        # Diagnostic: show what a top market actually looks like so we can see
+        # which fields Kalshi populates for this series.
+        s = max(hour, key=lambda m: _int(m.get("volume")))
+        log_kv(logger, logging.WARNING, "no quoted market; sample",
+               ticker=s.get("ticker"), yes_bid=s.get("yes_bid"), yes_ask=s.get("yes_ask"),
+               last_price=s.get("last_price"), volume=s.get("volume"),
+               open_interest=s.get("open_interest"), status=s.get("status"),
+               hour_markets=len(hour))
         pool = hour  # nothing quoted -- fall back so we still watch a real market
 
     pick = max(pool, key=lambda m: _int(m.get("volume")))
