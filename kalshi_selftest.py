@@ -424,6 +424,49 @@ def _test_pem_normalize(chk):
            (not s2.ready) and bool(s2.load_error))
 
 
+def _test_ai_layer(chk):
+    from types import SimpleNamespace as NS
+    import ai_strategy as ais
+
+    # Guardrails: AI can only veto or size DOWN, never up / never create entries.
+    chk.eq("no AI -> rules stand", ais.gate_entry(None, 100, "advisory")[:2], (True, 100))
+    hold = NS(action="hold", max_contracts=0, reason="thin", confidence=0.2)
+    chk.ok("AI veto blocks entry", ais.gate_entry(hold, 100, "advisory")[0] is False)
+    enter = NS(action="enter", max_contracts=10, reason="ok", confidence=0.9)
+    chk.eq("advisory keeps rule size", ais.gate_entry(enter, 100, "advisory")[1], 100)
+    chk.eq("decider sizes DOWN", ais.gate_entry(enter, 100, "decider")[1], 10)
+    big = NS(action="enter", max_contracts=999, reason="ok", confidence=0.9)
+    chk.eq("decider never sizes UP", ais.gate_entry(big, 100, "decider")[1], 100)
+
+    chk.eq("AI early exit fires", ais.ai_early_exit(NS(action="exit")), "exit")
+    chk.eq("AI scale_out fires", ais.ai_early_exit(NS(action="scale_out")), "scale_out")
+    chk.ok("no early exit on hold", ais.ai_early_exit(NS(action="hold")) is None)
+    chk.ok("no early exit on None", ais.ai_early_exit(None) is None)
+
+    # Off by default: no flag / no key -> disabled, decide() returns None.
+    strat = ais.AIStrategy(bot.Config(), logging.getLogger("t"))
+    chk.ok("AI off by default", not strat.enabled)
+    chk.ok("disabled decide -> None", strat.decide({}) is None)
+
+    # Enabled path with an injected client (no network) parses a decision.
+    if ais._HAVE_AI:
+        import os
+        os.environ["ANTHROPIC_API_KEY"] = "test-key"
+        cfg = bot.Config()
+        cfg.ai_enabled = True
+
+        class _Stub:
+            class messages:
+                @staticmethod
+                def parse(**kw):
+                    return NS(parsed_output=NS(action="enter", confidence=0.8,
+                                               max_contracts=5, reason="good setup"))
+        s = ais.AIStrategy(cfg, logging.getLogger("t"), client=_Stub())
+        chk.ok("AI enabled with key+client", s.enabled)
+        chk.eq("AI decide parses action", s.decide({"x": 1}).action, "enter")
+        os.environ.pop("ANTHROPIC_API_KEY", None)
+
+
 def _test_signing(chk):
     """Generate an ephemeral RSA key, sign, and verify RSA-PSS/SHA-256."""
     if not bot._HAVE_CRYPTO:
@@ -480,6 +523,7 @@ def run_selftests(cfg=None, logger=None) -> int:
     _test_supabase_sink(chk)
     _test_market_selection(chk)
     _test_get_top_from_market(chk)
+    _test_ai_layer(chk)
     _test_sign_strips_query(chk)
     _test_pem_normalize(chk)
     _test_reconcile(chk, cfg)

@@ -109,6 +109,11 @@ Sources (verified July 2026):
 | `KALSHI_LOG_PATH` | `kalshi_bot.log` | Structured JSON log path (rotating). |
 | `SUPABASE_URL` | — | Supabase project URL. Enables the Supabase mirror when set with the key below. |
 | `SUPABASE_SERVICE_ROLE_KEY` | — | Supabase **service-role** key (server-side only). Writes bypass RLS. |
+| `KALSHI_AI_ENABLED` | `false` | Turn the optional AI decision layer on. |
+| `KALSHI_AI_AUTHORITY` | `advisory` | `advisory` (AI may veto entries) or `decider` (veto + size down). |
+| `KALSHI_AI_MODEL` | `claude-opus-4-8` | Anthropic model id for the decision layer. |
+| `KALSHI_AI_MIN_INTERVAL_SEC` | `30` | Min seconds between AI exit checks (cost control). |
+| `ANTHROPIC_API_KEY` | — | Anthropic API key. Required only if `KALSHI_AI_ENABLED=true`. |
 
 > **On a hosting platform, prefer `KALSHI_PRIVATE_KEY_B64`.** Env-var editors
 > often collapse a multiline PEM's newlines (or turn them into spaces / literal
@@ -167,6 +172,31 @@ Leave them unset and the bot runs exactly as before with no external writes.
   with exponential backoff + full jitter, honouring `Retry-After` when present.
 - **Logging:** every event is written as one JSON object per line to a rotating
   file at `KALSHI_LOG_PATH`, plus a human-readable console line.
+
+## AI decision layer (optional, off by default)
+
+`ai_strategy.py` adds an optional AI layer (Claude Opus 4.8) that reviews each
+setup and can make the bot **more** conservative — never looser. Design rule:
+**the AI proposes, deterministic code disposes.**
+
+- It can **veto** a marginal entry, **size an entry down** (`decider` authority),
+  or trigger an **earlier exit** than the stop/take-profit.
+- It **cannot** place orders, enter outside the 85–90¢ band, size up, or bypass
+  the stop-loss or the `DEMO`/`DRY_RUN` gate. The deterministic stop-loss and
+  take-profit always fire regardless of the AI.
+- Everything degrades gracefully: no `ANTHROPIC_API_KEY`, package missing, API
+  error, or bad response → "no AI opinion" → the bot runs on its rules.
+- Every proposal is logged to the `kalshi_ai_decisions` Supabase table (what the
+  AI saw + what it proposed) for audit and backtesting.
+
+**You don't need Anthropic to run the bot** — the AI layer is off unless you set
+`KALSHI_AI_ENABLED=true` *and* provide `ANTHROPIC_API_KEY`. These go on the
+**bot host (Railway)**, never on Vercel (the dashboard doesn't call Claude).
+
+**Prove it before trusting it:** run `--paper` with the AI enabled and compare
+net expectancy per $1000 against the rule-based baseline. It only earns live
+trading if it beats the baseline *after fees* — and even then, behind the same
+guardrails.
 
 ## Go-live checklist
 

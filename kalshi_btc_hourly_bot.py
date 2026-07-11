@@ -62,6 +62,8 @@ from typing import Callable, Optional
 
 import requests
 
+from ai_strategy import AIStrategy, ai_early_exit, gate_entry  # optional AI layer
+
 try:  # cryptography is required for real auth; keep import errors friendly.
     from cryptography.hazmat.primitives import hashes, serialization
     from cryptography.hazmat.primitives.asymmetric import padding, rsa
@@ -170,6 +172,19 @@ class Config:
     # (markets roll every hour, so a 24/7 bot must follow the rollover).
     rollover_check_sec: float = field(
         default_factory=lambda: _env_float("KALSHI_ROLLOVER_CHECK_SEC", 60.0)
+    )
+
+    # --- AI decision layer (optional; OFF by default) --------------------- #
+    # Needs the anthropic package + ANTHROPIC_API_KEY. The bot runs fully
+    # without it -- it only ever makes the deterministic strategy MORE
+    # conservative (veto / size-down / earlier exit), never looser.
+    ai_enabled: bool = field(default_factory=lambda: _env_bool("KALSHI_AI_ENABLED", False))
+    ai_authority: str = field(
+        default_factory=lambda: os.getenv("KALSHI_AI_AUTHORITY", "advisory")
+    )
+    ai_model: str = field(default_factory=lambda: os.getenv("KALSHI_AI_MODEL", "claude-opus-4-8"))
+    ai_min_interval_sec: float = field(
+        default_factory=lambda: _env_float("KALSHI_AI_MIN_INTERVAL_SEC", 30.0)
     )
 
     # --- Supabase sink (optional) ----------------------------------------- #
@@ -777,6 +792,28 @@ def decide_exit(pos: Position, top: TopOfBook, cfg: Config) -> Optional[tuple]:
     return None
 
 
+def ai_snapshot(cfg: Config, ticker: str, top: TopOfBook,
+                pos: Optional["Position"] = None, phase: str = "entry") -> dict:
+    """Compact market/position snapshot handed to the AI decision layer."""
+    snap = {
+        "ticker": ticker, "phase": phase,
+        "yes_bid": top.yes_bid, "yes_ask": top.yes_ask,
+        "spread_cents": (top.yes_ask - top.yes_bid) if top.valid else None,
+        "entry_band": [cfg.entry_min_cents, cfg.entry_max_cents],
+        "take_profit_cents": cfg.take_profit_cents,
+        "stop_loss_cents": cfg.stop_loss_cents,
+        "fee_at_ask_cents": kalshi_fee_cents(1, top.yes_ask, cfg) if top.yes_ask else None,
+    }
+    if pos is not None:
+        unreal = ((top.yes_bid - pos.entry_price_cents) * pos.remaining
+                  if top.yes_bid is not None else None)
+        snap["position"] = {
+            "contracts": pos.remaining, "entry_price_cents": pos.entry_price_cents,
+            "unrealized_cents": unreal,
+        }
+    return snap
+
+
 # --------------------------------------------------------------------------- #
 # SQLite trade log
 # --------------------------------------------------------------------------- #
@@ -979,6 +1016,13 @@ class SupabaseSink:
             "ticker": ticker, "yes_bid": top.yes_bid, "yes_ask": top.yes_ask, "source": source,
         })
 
+    def record_ai_decision(self, run_id: str, ticker: str, phase: str, action: str,
+                           confidence: float, reason: str, snapshot: dict) -> None:
+        self._post("kalshi_ai_decisions", {
+            "run_id": run_id, "ticker": ticker, "phase": phase, "action": action,
+            "confidence": confidence, "reason": reason, "snapshot": snapshot,
+        })
+
     def _config_snapshot(self) -> dict:
         c = self.cfg
         return {
@@ -1026,11 +1070,14 @@ def run_paper(cfg: Config, client: KalshiClient, logger: logging.Logger,
               cycles: int, interval: float,
               book_source: Optional[Callable[[str], TopOfBook]] = None,
               ticker: Optional[str] = None,
-              sink: Optional["SupabaseSink"] = None) -> dict:
+              sink: Optional["SupabaseSink"] = None,
+              ai: Optional["AIStrategy"] = None) -> dict:
     """Paper-trade against the *live* order book, simulating fills locally.
 
     ``book_source(ticker) -> TopOfBook`` is injectable so the logic can be
-    exercised offline; by default it reads the live REST order book.
+    exercised offline; by default it reads the live REST order book. When ``ai``
+    is enabled the same veto / early-exit overlay runs, so you can backtest the
+    AI layer against the deterministic baseline before ever going live.
     """
     run_id = f"paper-{int(time.time())}"
     tradelog = TradeLog(cfg.db_path)
@@ -1064,6 +1111,15 @@ def run_paper(cfg: Config, client: KalshiClient, logger: logging.Logger,
         if pos is None:
             if decide_entry(top, cfg):
                 qty = contracts_for_notional(top.yes_ask, cfg.target_notional_usd)
+                if ai is not None and ai.enabled and qty > 0:
+                    ad = ai.decide(ai_snapshot(cfg, ticker, top, phase="entry"))
+                    if ad is not None and sink:
+                        sink.record_ai_decision(run_id, ticker, "entry", ad.action,
+                                                ad.confidence, ad.reason,
+                                                ai_snapshot(cfg, ticker, top, phase="entry"))
+                    proceed, qty, _ = gate_entry(ad, qty, cfg.ai_authority)
+                    if not proceed:
+                        qty = 0
                 if qty > 0:
                     entry_fee = kalshi_fee_cents(qty, top.yes_ask, cfg)
                     pos = Position(
@@ -1074,6 +1130,14 @@ def run_paper(cfg: Config, client: KalshiClient, logger: logging.Logger,
                            ticker=ticker, qty=qty, price=top.yes_ask, entry_fee=entry_fee)
         else:
             decision = decide_exit(pos, top, cfg)
+            if decision is None and ai is not None and ai.enabled:
+                ad = ai.decide(ai_snapshot(cfg, ticker, top, pos=pos, phase="manage"))
+                ea = ai_early_exit(ad)
+                if ea == "exit":
+                    decision = ("ai_exit", top.yes_bid, pos.remaining)
+                elif ea == "scale_out" and pos.remaining > 1:
+                    decision = ("ai_scale_out", top.yes_bid,
+                                max(1, int(pos.remaining * cfg.scale_out_fraction)))
             if decision:
                 reason, sell_price, qty = decision
                 simulate_fill_exit(pos, reason, sell_price, qty, cfg,
@@ -1317,7 +1381,8 @@ def reconcile_position_from_fills(client: KalshiClient, ticker: str,
 
 def run_manage(cfg: Config, client: KalshiClient, signer: KalshiSigner,
                logger: logging.Logger, cycles: Optional[int] = None,
-               sink: Optional["SupabaseSink"] = None, rollover: bool = False) -> None:
+               sink: Optional["SupabaseSink"] = None, rollover: bool = False,
+               ai: Optional["AIStrategy"] = None) -> None:
     """Manage a position from the WebSocket feed, falling back to REST.
 
     In LIVE mode the real position is the source of truth: it is reconciled
@@ -1368,6 +1433,7 @@ def run_manage(cfg: Config, client: KalshiClient, signer: KalshiSigner,
     grace = max(2 * cfg.poll_interval_sec, 5.0)
     pending_until = 0.0        # do not place another order before this (live only)
     last_roll_check = time.time()
+    last_ai_ts = 0.0           # throttle AI exit checks (cfg.ai_min_interval_sec)
     i = 0
     try:
         while cycles is None or i < cycles:
@@ -1434,10 +1500,21 @@ def run_manage(cfg: Config, client: KalshiClient, signer: KalshiSigner,
             if pos is None:
                 if now >= pending_until and top.valid and decide_entry(top, cfg):
                     qty = contracts_for_notional(top.yes_ask, cfg.target_notional_usd)
+                    # AI overlay: may veto or size the entry down (never up/looser).
+                    why = "rule:enter"
+                    if ai is not None and ai.enabled and qty > 0:
+                        ad = ai.decide(ai_snapshot(cfg, ticker, top, phase="entry"))
+                        if ad is not None and sink:
+                            sink.record_ai_decision(run_id, ticker, "entry", ad.action,
+                                                    ad.confidence, ad.reason,
+                                                    ai_snapshot(cfg, ticker, top, phase="entry"))
+                        proceed, qty, why = gate_entry(ad, qty, cfg.ai_authority)
+                        if not proceed:
+                            log_kv(logger, logging.INFO, "entry skipped by AI", reason=why)
                     if qty > 0:
                         coid = f"kbtc-{int(now*1000)}-{random.randint(0, 9999)}"
                         log_kv(logger, logging.INFO, "entry signal",
-                               price=top.yes_ask, qty=qty, source=source)
+                               price=top.yes_ask, qty=qty, source=source, why=why)
                         resp = client.place_order(ticker, "yes", "buy", qty,
                                                   top.yes_ask, client_order_id=coid)
                         placed = True
@@ -1452,6 +1529,21 @@ def run_manage(cfg: Config, client: KalshiClient, signer: KalshiSigner,
                                            entry_fee_cents=fee, opened_ts=now, remaining=qty)
             else:
                 decision = decide_exit(pos, top, cfg)
+                # AI overlay: may bring an exit FORWARD (rules' stop/TP still apply).
+                if (decision is None and ai is not None and ai.enabled and top.valid
+                        and now - last_ai_ts >= cfg.ai_min_interval_sec):
+                    last_ai_ts = now
+                    snap = ai_snapshot(cfg, ticker, top, pos=pos, phase="manage")
+                    ad = ai.decide(snap)
+                    if ad is not None and sink:
+                        sink.record_ai_decision(run_id, ticker, "manage", ad.action,
+                                                ad.confidence, ad.reason, snap)
+                    ea = ai_early_exit(ad)
+                    if ea == "exit":
+                        decision = ("ai_exit", top.yes_bid, pos.remaining)
+                    elif ea == "scale_out" and pos.remaining > 1:
+                        decision = ("ai_scale_out", top.yes_bid,
+                                    max(1, int(pos.remaining * cfg.scale_out_fraction)))
                 if decision and now >= pending_until:
                     reason, sell_price, qty = decision
                     coid = f"kbtc-{int(now*1000)}-{random.randint(0, 9999)}"
@@ -1534,6 +1626,7 @@ def main(argv: Optional[list] = None) -> int:
                "(check KALSHI_PRIVATE_KEY_PEM formatting)", error=signer.load_error)
     client = KalshiClient(cfg, signer, logger)
     sink = SupabaseSink(cfg, logger)
+    ai = AIStrategy(cfg, logger)
     interval = args.interval if args.interval is not None else cfg.poll_interval_sec
 
     if args.report:
@@ -1544,18 +1637,19 @@ def main(argv: Optional[list] = None) -> int:
 
     if args.paper:
         summary = run_paper(cfg, client, logger, cycles=args.cycles,
-                            interval=interval, sink=sink)
+                            interval=interval, sink=sink, ai=ai)
         print_summary(summary)
         return 0
 
     if args.forever:
         # Always-on worker: run indefinitely, following the hourly rollover.
         log_kv(logger, logging.INFO, "starting always-on worker (--forever)")
-        run_manage(cfg, client, signer, logger, cycles=None, sink=sink, rollover=True)
+        run_manage(cfg, client, signer, logger, cycles=None, sink=sink,
+                   rollover=True, ai=ai)
         return 0
 
     if args.manage:
-        run_manage(cfg, client, signer, logger, cycles=args.cycles, sink=sink)
+        run_manage(cfg, client, signer, logger, cycles=args.cycles, sink=sink, ai=ai)
         return 0
 
     # Default: resolve and print the active ticker + top of book.
