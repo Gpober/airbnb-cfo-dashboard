@@ -226,6 +226,22 @@ class _JsonFormatter(logging.Formatter):
         return json.dumps(payload, default=str)
 
 
+class _ConsoleFormatter(logging.Formatter):
+    """Human-readable console line that also appends the structured kv fields.
+
+    Without this, `log_kv(..., ticker=..., yes_bid=...)` would print only the
+    bare message on the console (and hosts like Railway only show the console),
+    hiding the very fields we log for diagnosis. Append them as k=v pairs.
+    """
+
+    def format(self, record: logging.LogRecord) -> str:
+        base = super().format(record)
+        kv = getattr(record, "kv", None)
+        if isinstance(kv, dict) and kv:
+            base += " " + " ".join(f"{k}={v}" for k, v in kv.items())
+        return base
+
+
 def setup_logging(cfg: Config, verbose: bool = False) -> logging.Logger:
     logger = logging.getLogger("kalshi_btc")
     logger.setLevel(logging.DEBUG if verbose else logging.INFO)
@@ -238,9 +254,9 @@ def setup_logging(cfg: Config, verbose: bool = False) -> logging.Logger:
     fh.setFormatter(_JsonFormatter())
     logger.addHandler(fh)
 
-    # Human-readable console log.
+    # Human-readable console log (includes kv fields so hosted logs show them).
     ch = logging.StreamHandler(sys.stdout)
-    ch.setFormatter(logging.Formatter("%(asctime)s %(levelname)-5s %(message)s"))
+    ch.setFormatter(_ConsoleFormatter("%(asctime)s %(levelname)-5s %(message)s"))
     logger.addHandler(ch)
     logger.propagate = False
     return logger
@@ -448,8 +464,11 @@ class KalshiClient:
             attempt += 1
             headers = {"Content-Type": "application/json", "Accept": "application/json"}
             if signed:
-                # Sign the full path (prefix + query), which is what we send.
-                headers.update(self.signer.sign(method, f"/trade-api/v2{path}"))
+                # Kalshi signs the path WITHOUT the query string: strip everything
+                # from the first '?'. Signing the query string yields a bad
+                # signature and a 401 on any request with query params.
+                sign_path = f"/trade-api/v2{path.split('?', 1)[0]}"
+                headers.update(self.signer.sign(method, sign_path))
             try:
                 resp = self.session.request(
                     method,
@@ -506,14 +525,55 @@ class KalshiClient:
     def get_markets(self, **params) -> dict:
         query = "&".join(f"{k}={v}" for k, v in params.items() if v is not None)
         path = "/markets" + (f"?{query}" if query else "")
-        return self._request("GET", path, signed=False)
+        # Sign when we have a key: Kalshi populates live quotes/order books only
+        # for authenticated requests. Falls back to unsigned when no key is set.
+        return self._request("GET", path, signed=self.signer.ready)
+
+    def get_all_markets(self, max_pages: int = 10, **params) -> list:
+        """Fetch markets across pages (KXBTCD is a large strike ladder).
+
+        Follows the cursor so we see every strike, not just the first page --
+        otherwise market selection can miss the liquid, in-band contract.
+        """
+        out: list = []
+        cursor: Optional[str] = None
+        for _ in range(max_pages):
+            page = dict(params)
+            page["limit"] = 1000
+            if cursor:
+                page["cursor"] = cursor
+            data = self.get_markets(**page)
+            out.extend(data.get("markets", []))
+            cursor = data.get("cursor")
+            if not cursor:
+                break
+        return out
 
     def get_orderbook(self, ticker: str, depth: int = 1) -> dict:
         path = f"/markets/{ticker}/orderbook?depth={depth}"
-        data = self._request("GET", path, signed=False)
+        data = self._request("GET", path, signed=self.signer.ready)
         return data.get("orderbook", {})
 
+    def get_market(self, ticker: str) -> dict:
+        data = self._request("GET", f"/markets/{ticker}", signed=self.signer.ready)
+        return data.get("market", {})
+
     def get_top(self, ticker: str) -> TopOfBook:
+        """Top-of-book for ``ticker``.
+
+        Prefer the market object's own ``yes_bid``/``yes_ask`` quote (public and
+        reliably populated). The dedicated order-book endpoint can require auth
+        and come back empty, so it's only a fallback.
+        """
+        try:
+            m = self.get_market(ticker)
+            yb = int(m.get("yes_bid") or 0)
+            ya = int(m.get("yes_ask") or 0)
+            top = TopOfBook(yes_bid=yb or None, yes_ask=ya or None, ts=time.time())
+            if top.valid:
+                return top
+        except Exception:
+            pass  # fall through to the order-book endpoint
         return top_from_orderbook(self.get_orderbook(ticker, depth=1))
 
     # -- authenticated endpoints ----------------------------------------- #
@@ -588,29 +648,82 @@ class KalshiClient:
 
 
 def resolve_active_ticker(client: KalshiClient, series_ticker: str,
-                          logger: logging.Logger) -> Optional[str]:
-    """Find the current, open, soonest-closing market in ``series_ticker``.
+                          logger: logging.Logger,
+                          cfg: Optional[Config] = None) -> Optional[str]:
+    """Select the tradeable market in ``series_ticker`` for this hour.
 
-    Confirms the live ticker via ``GET /markets`` rather than trusting a
-    hard-coded value (hourly markets rotate). Returns None on any error so
-    callers degrade gracefully instead of crashing.
+    KXBTCD is a *strike ladder*: each hour has many strike markets, and most
+    are illiquid with empty books. Picking the first by close-time (the old
+    behaviour) lands on a dead strike. Instead, within the soonest-closing
+    hour, use the quotes Kalshi returns in ``GET /markets`` to pick a market
+    that is actually trading -- preferring one whose YES ask is inside the
+    entry band, else the most liquid quoted strike. Returns None on error so
+    callers degrade gracefully.
     """
     try:
-        data = client.get_markets(series_ticker=series_ticker, status="open", limit=200)
+        markets = client.get_all_markets(series_ticker=series_ticker, status="open")
     except Exception as exc:
         log_kv(logger, logging.ERROR, "market lookup failed",
                series=series_ticker, error=str(exc))
         return None
-    markets = data.get("markets", [])
     if not markets:
         log_kv(logger, logging.WARNING, "no open markets", series=series_ticker)
         return None
-    # Soonest close = the currently active hourly contract.
-    markets.sort(key=lambda m: m.get("close_time", ""))
-    ticker = markets[0]["ticker"]
-    log_kv(logger, logging.INFO, "resolved active ticker",
-           series=series_ticker, ticker=ticker, open_markets=len(markets))
-    return ticker
+
+    # Restrict to the currently-active hour (soonest close time).
+    soonest = min((m.get("close_time", "") for m in markets if m.get("close_time")),
+                  default="")
+    hour = [m for m in markets if m.get("close_time", "") == soonest] or markets
+
+    # Markets with a real two-sided quote (yes_bid and yes_ask are cents; 0/None
+    # means no quote). These are the only ones worth watching or trading.
+    def _int(v):
+        try:
+            return int(v)
+        except (TypeError, ValueError):
+            return 0
+
+    def _band(m):
+        return cfg is not None and cfg.entry_min_cents <= _int(m.get("yes_ask")) <= cfg.entry_max_cents
+
+    quoted = [m for m in hour if _int(m.get("yes_bid")) and _int(m.get("yes_ask"))]
+
+    # The /markets LIST often omits live quotes even when authenticated. If so,
+    # probe the most active strikes directly -- the single-market endpoint
+    # returns the live quote -- and stop as soon as we find an in-band one.
+    if not quoted:
+        cands = sorted(hour, key=lambda m: _int(m.get("open_interest")) + _int(m.get("volume")),
+                       reverse=True)[:15]
+        for m in cands:
+            try:
+                mk = client.get_market(m["ticker"])
+            except Exception:
+                continue
+            yb, ya = _int(mk.get("yes_bid")), _int(mk.get("yes_ask"))
+            if yb and ya:
+                m = {**m, "yes_bid": yb, "yes_ask": ya}
+                quoted.append(m)
+                if _band(m):
+                    break
+
+    in_band = [m for m in quoted if _band(m)]
+    pool = in_band or quoted
+    if not pool:
+        # Diagnostic: show what a top market actually looks like so we can see
+        # which fields Kalshi populates for this series.
+        s = max(hour, key=lambda m: _int(m.get("volume")))
+        log_kv(logger, logging.WARNING, "no quoted market; sample",
+               ticker=s.get("ticker"), yes_bid=s.get("yes_bid"), yes_ask=s.get("yes_ask"),
+               last_price=s.get("last_price"), volume=s.get("volume"),
+               open_interest=s.get("open_interest"), status=s.get("status"),
+               hour_markets=len(hour))
+        pool = hour  # nothing quoted -- fall back so we still watch a real market
+
+    pick = max(pool, key=lambda m: _int(m.get("volume")))
+    log_kv(logger, logging.INFO, "selected market", ticker=pick["ticker"],
+           yes_bid=pick.get("yes_bid"), yes_ask=pick.get("yes_ask"),
+           in_band=bool(in_band), quoted=len(quoted), open_markets=len(markets))
+    return pick["ticker"]
 
 
 # --------------------------------------------------------------------------- #
@@ -916,7 +1029,7 @@ def run_paper(cfg: Config, client: KalshiClient, logger: logging.Logger,
     get_top = book_source or client.get_top
 
     if ticker is None:
-        ticker = resolve_active_ticker(client, cfg.series_ticker, logger)
+        ticker = resolve_active_ticker(client, cfg.series_ticker, logger, cfg)
         if ticker is None:
             log_kv(logger, logging.ERROR, "no active ticker; aborting paper run")
             return tradelog.summary(run_id)
@@ -1231,7 +1344,7 @@ def run_manage(cfg: Config, client: KalshiClient, signer: KalshiSigner,
         state["feed"] = f
         return ok
 
-    ticker = resolve_active_ticker(client, cfg.series_ticker, logger)
+    ticker = resolve_active_ticker(client, cfg.series_ticker, logger, cfg)
     pos: Optional[Position] = None
     ws_ok = False
     if ticker:
@@ -1255,7 +1368,7 @@ def run_manage(cfg: Config, client: KalshiClient, signer: KalshiSigner,
             # --- hourly rollover: follow the active market ----------------- #
             if rollover and (time.time() - last_roll_check) >= cfg.rollover_check_sec:
                 last_roll_check = time.time()
-                new_ticker = resolve_active_ticker(client, cfg.series_ticker, logger)
+                new_ticker = resolve_active_ticker(client, cfg.series_ticker, logger, cfg)
                 if new_ticker and new_ticker != ticker:
                     log_kv(logger, logging.INFO, "ticker rollover",
                            old=ticker, new=new_ticker)
@@ -1438,7 +1551,7 @@ def main(argv: Optional[list] = None) -> int:
         return 0
 
     # Default: resolve and print the active ticker + top of book.
-    ticker = resolve_active_ticker(client, cfg.series_ticker, logger)
+    ticker = resolve_active_ticker(client, cfg.series_ticker, logger, cfg)
     if ticker:
         try:
             top = client.get_top(ticker)

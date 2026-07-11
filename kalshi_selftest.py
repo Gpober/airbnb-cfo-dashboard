@@ -152,8 +152,9 @@ def _test_manage_dryrun(chk):
     state = {"i": 0}
 
     class _Stub:
-        def get_markets(self, **kw):
-            return {"markets": [{"ticker": "KXBTCD-T", "close_time": "2026-07-10T20:00:00Z"}]}
+        def get_all_markets(self, **kw):
+            return [{"ticker": "KXBTCD-T", "close_time": "2026-07-10T20:00:00Z",
+                     "yes_bid": 86, "yes_ask": 87, "volume": 100}]
 
         def get_top(self, ticker):
             b = books[min(state["i"], len(books) - 1)]
@@ -226,6 +227,111 @@ def _test_paper_harness(chk, cfg):
     chk.ok("paper positive net P&L", summary.get("total_net_pnl_cents", 0) > 0)
     # Entry 87c -> exit 99c on ~11 contracts nets ~ (99-87)*11 - fees > 0.
     chk.ok("paper expectancy computed", "net_expectancy_per_1000_cents" in summary)
+
+
+def _test_sign_strips_query(chk):
+    """The signed path must exclude the query string (Kalshi requirement)."""
+    if not bot._HAVE_CRYPTO:
+        print("  SKIP  sign strips query (cryptography not installed)")
+        return
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric import rsa
+
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    pem = key.private_bytes(serialization.Encoding.PEM,
+                            serialization.PrivateFormat.PKCS8,
+                            serialization.NoEncryption()).decode()
+    cfg = bot.Config()
+    cfg.api_key_id = "kid"
+    cfg.private_key_pem = pem
+    signer = bot.KalshiSigner(cfg)
+    client = bot.KalshiClient(cfg, signer, logging.getLogger("t"))
+
+    captured = {}
+    real_sign = signer.sign
+    signer.sign = lambda method, path: (captured.__setitem__("path", path) or real_sign(method, path))
+
+    class _Resp:
+        status_code = 200
+        content = b'{"fills":[]}'
+
+        def json(self):
+            return {"fills": []}
+
+        def raise_for_status(self):
+            pass
+
+    client.session.request = lambda *a, **k: _Resp()
+    client.get_fills(ticker="KXBTCD-X", limit=200)
+    chk.eq("signed path has no query string",
+           captured.get("path"), "/trade-api/v2/portfolio/fills")
+
+
+def _test_get_top_from_market(chk):
+    cfg = bot.Config()
+    client = bot.KalshiClient(cfg, bot.KalshiSigner(cfg), logging.getLogger("t"))
+    # Market object carries a quote -> used directly (order book not needed).
+    client.get_market = lambda t: {"yes_bid": 86, "yes_ask": 88}
+    client.get_orderbook = lambda t, depth=1: {"yes": [], "no": []}
+    top = client.get_top("X")
+    chk.eq("get_top uses market yes_bid", top.yes_bid, 86)
+    chk.eq("get_top uses market yes_ask", top.yes_ask, 88)
+    # Empty market quote -> fall back to the order book endpoint.
+    client.get_market = lambda t: {"yes_bid": 0, "yes_ask": 0}
+    client.get_orderbook = lambda t, depth=1: {"yes": [[70, 5]], "no": [[11, 3]]}
+    top2 = client.get_top("X")
+    chk.eq("get_top falls back to orderbook", (top2.yes_bid, top2.yes_ask), (70, 89))
+
+
+def _test_market_selection(chk):
+    cfg = bot.Config()  # entry band 85-90
+
+    class _Ladder:
+        def get_all_markets(self, **kw):
+            return [
+                # current hour (soonest close): empty strike, in-band strike, liquid off-band strike
+                {"ticker": "KX-A-T1", "close_time": "2026-07-11T18:00:00Z", "yes_bid": 0,  "yes_ask": 0,  "volume": 0},
+                {"ticker": "KX-A-T2", "close_time": "2026-07-11T18:00:00Z", "yes_bid": 86, "yes_ask": 88, "volume": 500},
+                {"ticker": "KX-A-T3", "close_time": "2026-07-11T18:00:00Z", "yes_bid": 40, "yes_ask": 42, "volume": 9000},
+                # later hour, in-band + high volume, but must be ignored (not soonest)
+                {"ticker": "KX-B-T2", "close_time": "2026-07-11T19:00:00Z", "yes_bid": 87, "yes_ask": 89, "volume": 99999},
+            ]
+    t = bot.resolve_active_ticker(_Ladder(), "KXBTCD", logging.getLogger("t"), cfg)
+    chk.eq("picks in-band strike in current hour", t, "KX-A-T2")
+
+    class _NoBand:
+        def get_all_markets(self, **kw):
+            return [
+                {"ticker": "E1", "close_time": "2026-07-11T18:00:00Z", "yes_bid": 0,  "yes_ask": 0,  "volume": 0},
+                {"ticker": "E2", "close_time": "2026-07-11T18:00:00Z", "yes_bid": 40, "yes_ask": 42, "volume": 100},
+                {"ticker": "E3", "close_time": "2026-07-11T18:00:00Z", "yes_bid": 55, "yes_ask": 57, "volume": 9000},
+            ]
+    chk.eq("no in-band -> most liquid quoted",
+           bot.resolve_active_ticker(_NoBand(), "KXBTCD", logging.getLogger("t"), cfg), "E3")
+
+    class _Empty:
+        def get_all_markets(self, **kw):
+            return []
+    chk.ok("no markets -> None",
+           bot.resolve_active_ticker(_Empty(), "KXBTCD", logging.getLogger("t"), cfg) is None)
+
+    # List omits quotes -> probe get_market for the live quote and pick in-band.
+    quotes = {"P2": (86, 88)}
+
+    class _Probe:
+        def get_all_markets(self, **kw):
+            return [
+                {"ticker": "P1", "close_time": "2026-07-11T18:00:00Z", "yes_bid": 0, "yes_ask": 0, "volume": 100, "open_interest": 10},
+                {"ticker": "P2", "close_time": "2026-07-11T18:00:00Z", "yes_bid": 0, "yes_ask": 0, "volume": 50, "open_interest": 9},
+                {"ticker": "P3", "close_time": "2026-07-11T18:00:00Z", "yes_bid": 0, "yes_ask": 0, "volume": 1, "open_interest": 1},
+            ]
+
+        def get_market(self, ticker):
+            yb, ya = quotes.get(ticker, (0, 0))
+            return {"yes_bid": yb, "yes_ask": ya}
+
+    chk.eq("probe finds live-quoted in-band market",
+           bot.resolve_active_ticker(_Probe(), "KXBTCD", logging.getLogger("t"), cfg), "P2")
 
 
 def _test_supabase_sink(chk):
@@ -371,6 +477,9 @@ def run_selftests(cfg=None, logger=None) -> int:
     _test_ws_desync(chk, cfg)
     _test_manage_dryrun(chk)
     _test_supabase_sink(chk)
+    _test_market_selection(chk)
+    _test_get_top_from_market(chk)
+    _test_sign_strips_query(chk)
     _test_pem_normalize(chk)
     _test_reconcile(chk, cfg)
     _test_paper_harness(chk, cfg)
