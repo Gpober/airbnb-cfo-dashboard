@@ -98,7 +98,60 @@ def strat_meanrev(prices: List[float], side: int, window: int = 48, z: float = 1
     return side
 
 
-STRATEGIES = {"flat": strat_flat, "sma": strat_sma, "meanrev": strat_meanrev}
+def strat_breakout(prices: List[float], side: int, lookback: int = 24) -> int:
+    """Donchian breakout: long on a new N-bar high, short on a new N-bar low."""
+    if len(prices) < lookback + 1:
+        return 0
+    window = prices[-(lookback + 1):-1]
+    p = prices[-1]
+    if p > max(window):
+        return 1
+    if p < min(window):
+        return -1
+    return side            # hold inside the channel
+
+
+def strat_momentum(prices: List[float], side: int,
+                   lookback: int = 24, thresh: float = 0.01) -> int:
+    """Momentum: long if price rose > thresh over the lookback, short if it fell."""
+    if len(prices) < lookback + 1:
+        return 0
+    roc = prices[-1] / prices[-1 - lookback] - 1.0
+    if roc > thresh:
+        return 1
+    if roc < -thresh:
+        return -1
+    return 0
+
+
+STRATEGIES = {
+    "flat": strat_flat, "sma": strat_sma, "meanrev": strat_meanrev,
+    "breakout": strat_breakout, "momentum": strat_momentum,
+}
+
+
+def load_prices_csv(path: str, column: str = "close") -> List[float]:
+    """Load a price series from a CSV (header row; picks the ``close`` column,
+    else the first numeric column). Real historical data is the ONLY way this
+    sim can discover a genuine edge -- see the note in run_batch/main."""
+    import csv
+    prices: List[float] = []
+    with open(path, newline="") as f:
+        reader = csv.reader(f)
+        header = next(reader, None) or []
+        low = [h.strip().lower() for h in header]
+        idx = low.index(column) if column in low else 0
+        # If the "header" was actually numeric data, keep it.
+        try:
+            prices.append(float(header[idx]))
+        except (ValueError, IndexError):
+            pass
+        for row in reader:
+            try:
+                prices.append(float(row[idx]))
+            except (ValueError, IndexError):
+                continue
+    return prices
 
 
 # --------------------------------------------------------------------------- #
@@ -277,6 +330,25 @@ def print_report(name: str, cfg: SimConfig, agg: dict, mu: float) -> None:
     print(f"VERDICT: {verdict}")
 
 
+GBM_CAVEAT = (
+    "NOTE: random (GBM) paths are a NO-EDGE world by construction -- no strategy\n"
+    "can beat them beyond luck. That makes this great for REJECTING strategies and\n"
+    "measuring fee/funding/leverage drag, but it can NEVER discover a real edge.\n"
+    "To hunt for an actual edge, backtest on REAL price history:  --prices data.csv"
+)
+
+
+def print_single(name: str, cfg: SimConfig, r: SimResult) -> None:
+    print(f"\n=== PERPS SIM (real data): {name}  (leverage={cfg.leverage}x) ===")
+    print(f"final equity          ${r.final_equity:.2f}  ({r.return_pct:+.1f}%)")
+    print(f"trades                {r.trades}  (win rate "
+          f"{'n/a' if r.win_rate is None else f'{r.win_rate:.0%}'})")
+    print(f"max drawdown          {r.max_drawdown_pct:.0f}%")
+    print(f"liquidations          {r.liquidations}")
+    print(f"fees / funding paid   ${r.fees_paid:.2f} / ${r.funding_paid:+.2f}")
+    print(f"VERDICT: {'PROFITABLE on this history (one sample -- validate out-of-sample)' if r.return_pct > 0 else 'loses on this history'}")
+
+
 def main(argv=None) -> int:
     p = argparse.ArgumentParser(description="Perpetual-futures strategy simulator")
     p.add_argument("--strategy", choices=list(STRATEGIES), default="sma")
@@ -286,12 +358,24 @@ def main(argv=None) -> int:
     p.add_argument("--mu", type=float, default=0.0, help="annualized drift (0=fair)")
     p.add_argument("--sigma", type=float, default=0.6, help="annualized volatility")
     p.add_argument("--seed", type=int, default=1)
+    p.add_argument("--prices", help="CSV of real historical prices to backtest on")
     args = p.parse_args(argv)
 
     cfg = SimConfig(leverage=args.leverage)
+
+    if args.prices:
+        prices = load_prices_csv(args.prices)
+        if len(prices) < 50:
+            print(f"need >=50 price points, got {len(prices)}")
+            return 1
+        r = simulate(prices, STRATEGIES[args.strategy], cfg)
+        print_single(args.strategy, cfg, r)
+        return 0
+
     agg = run_batch(STRATEGIES[args.strategy], cfg, paths=args.paths,
                     steps=args.steps, sigma=args.sigma, mu=args.mu, seed=args.seed)
     print_report(args.strategy, cfg, agg, args.mu)
+    print("\n" + GBM_CAVEAT)
     return 0
 
 
