@@ -635,6 +635,58 @@ def _test_remote_settings(chk):
     chk.ok("fetched pause applied", r.paused is True)
 
 
+def _test_perps_sim(chk):
+    import perps_sim as ps
+    import random as _r
+
+    long_always = lambda prices, side: 1
+    short_always = lambda prices, side: -1
+    noloss = ps.SimConfig(fee_rate=0.0, funding_rate_per_step=0.0, leverage=1.0)
+
+    # Flat strategy never trades -> equity is exactly preserved.
+    r = ps.simulate([100, 101, 99, 102, 100], ps.strat_flat, noloss)
+    chk.eq("flat strategy no trades", r.trades, 0)
+    chk.eq("flat strategy preserves equity", round(r.final_equity, 6), 1000.0)
+
+    # Long into a rising market profits (no fees/funding to isolate).
+    rising = [100 + i for i in range(31)]
+    r = ps.simulate(rising, long_always, noloss)
+    chk.ok("long profits on a rise", r.final_equity > 1000.0)
+
+    # Short into a falling market profits.
+    falling = [100 - i for i in range(7)]
+    r = ps.simulate(falling, short_always, noloss)
+    chk.ok("short profits on a fall", r.final_equity > 1000.0)
+
+    # Leverage kills: a long into a crash at 20x gets liquidated.
+    crash = [100, 97, 94, 91]
+    r = ps.simulate(crash, long_always, ps.SimConfig(leverage=20.0, fee_rate=0.0,
+                                                     funding_rate_per_step=0.0))
+    chk.ok("high leverage liquidates on a crash", r.liquidations >= 1)
+    chk.ok("liquidation loses money", r.final_equity < 1000.0)
+
+    # Fees bleed even on a flat price (open + close both cost).
+    enter_then_flat = lambda prices, side: 1 if len(prices) == 1 else 0
+    r = ps.simulate([100, 100, 100], enter_then_flat,
+                    ps.SimConfig(leverage=1.0, fee_rate=0.001, funding_rate_per_step=0.0))
+    chk.ok("fees bleed equity on flat price", r.final_equity < 1000.0)
+
+    # Funding drags a held long even on a flat price.
+    r = ps.simulate([100, 100, 100, 100], long_always,
+                    ps.SimConfig(leverage=1.0, fee_rate=0.0, funding_rate_per_step=0.01))
+    chk.ok("funding drags a held long", r.final_equity < 1000.0)
+
+    # GBM path is deterministic given a seeded RNG (needed for reproducible tests).
+    p1 = ps.gbm_path(10, rng=_r.Random(42))
+    p2 = ps.gbm_path(10, rng=_r.Random(42))
+    chk.ok("gbm path reproducible with seed", p1 == p2)
+
+    # Honest headline: no real edge (fair random walk) -> verdict is "no edge".
+    agg = ps.run_batch(ps.strat_sma, ps.SimConfig(leverage=3.0), paths=120, seed=7)
+    chk.ok("random walk is not demonstrably profitable",
+           not (agg["median_return_pct"] > 0 and agg["profitable_pct"] > 55.0))
+
+
 def _test_signing(chk):
     """Generate an ephemeral RSA key, sign, and verify RSA-PSS/SHA-256."""
     if not bot._HAVE_CRYPTO:
@@ -694,6 +746,7 @@ def run_selftests(cfg=None, logger=None) -> int:
     _test_ai_layer(chk)
     _test_performance_memory(chk)
     _test_remote_settings(chk)
+    _test_perps_sim(chk)
     _test_sign_strips_query(chk)
     _test_pem_normalize(chk)
     _test_reconcile(chk, cfg)
