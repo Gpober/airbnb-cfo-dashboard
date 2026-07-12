@@ -681,6 +681,21 @@ def _test_perps_sim(chk):
     p2 = ps.gbm_path(10, rng=_r.Random(42))
     chk.ok("gbm path reproducible with seed", p1 == p2)
 
+    # Breakout / momentum strategies fire in the right direction.
+    chk.eq("breakout longs a new high", ps.strat_breakout(list(range(100, 130)), 0, 10), 1)
+    chk.eq("breakout shorts a new low", ps.strat_breakout(list(range(130, 100, -1)), 0, 10), -1)
+    chk.eq("momentum longs an up-move", ps.strat_momentum([100] * 24 + [110], 0, 24, 0.01), 1)
+    chk.eq("momentum shorts a down-move", ps.strat_momentum([100] * 24 + [90], 0, 24, 0.01), -1)
+
+    # Real-data CSV loader picks the close column.
+    import tempfile, os
+    fd, path = tempfile.mkstemp(suffix=".csv")
+    with os.fdopen(fd, "w") as f:
+        f.write("time,close\n1,100\n2,101\n3,102\n")
+    loaded = ps.load_prices_csv(path)
+    os.unlink(path)
+    chk.eq("csv loads close column", loaded, [100.0, 101.0, 102.0])
+
     # Honest headline: no real edge (fair random walk) -> verdict is "no edge".
     agg = ps.run_batch(ps.strat_sma, ps.SimConfig(leverage=3.0), paths=120, seed=7)
     chk.ok("random walk is not demonstrably profitable",
