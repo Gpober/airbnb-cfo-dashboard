@@ -702,6 +702,43 @@ def _test_perps_sim(chk):
            not (agg["median_return_pct"] > 0 and agg["profitable_pct"] > 55.0))
 
 
+def _test_perps_backtest(chk):
+    import perps_backtest as pb
+
+    # Coinbase candle = [time, low, high, open, close, volume] -> (time, close).
+    parsed = pb.parse_candles([[1000, 10, 20, 12, 15.5, 1.0], [1600, 9, 19, 15, 18.0, 2.0]])
+    chk.eq("parse_candles picks close", parsed, [(1000, 15.5), (1600, 18.0)])
+    chk.eq("parse_candles skips bad rows",
+           pb.parse_candles([["x"], [1000, 1, 2, 3, 4, 5]]), [(1000, 4.0)])
+
+    # fetch pages until an empty response, with no real network.
+    class _Resp:
+        def __init__(self, rows):
+            self.status_code = 200
+            self.text = ""
+            self._rows = rows
+        def json(self):
+            return self._rows
+
+    class _Sess:
+        def __init__(self):
+            self.n = 0
+        def get(self, *a, **k):
+            self.n += 1
+            if self.n == 1:
+                return _Resp([[2000, 1, 2, 3, 101.0, 1], [1600, 1, 2, 3, 100.0, 1]])
+            return _Resp([])   # no more data -> loop stops
+
+    series = pb.fetch_coinbase_hourly(hours=10, session=_Sess(), log=lambda *a: None)
+    chk.eq("fetch returns closes sorted by time", series, [100.0, 101.0])
+
+    # report runs and benchmarks buy & hold on a real-shaped series.
+    prices = [100 + (i % 7) - 3 + i * 0.1 for i in range(200)]  # mild uptrend + wiggle
+    out = pb.report(prices, leverage=2.0, log=lambda *a: None)
+    chk.ok("report returns buy&hold benchmark", "buy_hold_pct" in out)
+    chk.ok("report ranks all strategies", len(out.get("results", {})) >= 3)
+
+
 def _test_signing(chk):
     """Generate an ephemeral RSA key, sign, and verify RSA-PSS/SHA-256."""
     if not bot._HAVE_CRYPTO:
@@ -762,6 +799,7 @@ def run_selftests(cfg=None, logger=None) -> int:
     _test_performance_memory(chk)
     _test_remote_settings(chk)
     _test_perps_sim(chk)
+    _test_perps_backtest(chk)
     _test_sign_strips_query(chk)
     _test_pem_normalize(chk)
     _test_reconcile(chk, cfg)

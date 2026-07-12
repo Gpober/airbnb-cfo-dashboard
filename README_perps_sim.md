@@ -35,6 +35,24 @@ Strategies included: `flat` (control), `sma` (trend-following), `meanrev`
 (fade extremes). Add your own by writing a `(price_history, side) -> {-1,0,1}`
 function and registering it in `STRATEGIES`.
 
+## Backtest on REAL data (`perps_backtest.py`)
+
+Random paths can't discover an edge — only real price history can. `perps_backtest.py`
+fetches public hourly BTC candles from Coinbase (no API key) and backtests every
+strategy against buy & hold, with an out-of-sample split. It needs open internet,
+so run it **on Railway** (the dev sandbox is network-locked), not locally here.
+
+Run it as a Railway one-off / temporary custom start command:
+
+```bash
+python perps_backtest.py --hours 2000 --leverage 3
+```
+
+It prints a ranked table to your Railway logs. The **bar to beat is buy & hold**:
+a positive return in a BTC bull run means nothing if simply holding did better. A
+strategy only earns interest if it **beats buy & hold AND stays positive
+out-of-sample.** Revert the start command to `--forever` when done.
+
 ## The honest headline
 On a zero-drift random walk, every built-in strategy shows **no demonstrable
 edge** — fees and funding bleed it, and leverage just adds liquidations. That's
