@@ -198,6 +198,29 @@ def _test_reconcile(chk, cfg):
     chk.ok("reconcile flat -> None",
            bot.reconcile_position_from_fills(_FlatClient(), "T", logging.getLogger("t")) is None)
 
+    # V2 fills: prices as *_dollars floats, count as a fixed-point string.
+    class _V2Client:
+        def get_fills(self, ticker=None, limit=200):
+            return [
+                {"side": "yes", "action": "buy", "count": "8.00",
+                 "yes_price_dollars": 0.90, "fee_dollars": 0.02},
+                {"side": "yes", "action": "buy", "count": "2.00",
+                 "yes_price_dollars": 0.88, "fee_dollars": 0.01},
+            ]
+    v2 = bot.reconcile_position_from_fills(_V2Client(), "T", logging.getLogger("t"))
+    chk.eq("V2 dollar fills net", v2.contracts, 10)
+    chk.eq("V2 dollar fills avg entry", v2.entry_price_cents, 90)  # 896/10 -> 90
+
+    # A fill with no parseable price is skipped, not fatal (the old int(None) crash).
+    class _BadFill:
+        def get_fills(self, ticker=None, limit=200):
+            return [
+                {"side": "yes", "action": "buy", "count": "5", "yes_price_dollars": 0.87},
+                {"side": "yes", "action": "buy", "count": "3", "yes_price": None, "no_price": None},
+            ]
+    bad = bot.reconcile_position_from_fills(_BadFill(), "T", logging.getLogger("t"))
+    chk.eq("unparseable fill skipped, good one kept", bad.contracts, 5)
+
 
 def _test_paper_harness(chk, cfg):
     """Drive run_paper with a scripted synthetic book through a full trade."""
