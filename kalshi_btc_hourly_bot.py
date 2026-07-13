@@ -490,6 +490,40 @@ def top_from_orderbook(ob: dict) -> TopOfBook:
     return TopOfBook(yes_bid=yes_bid, yes_ask=yes_ask, ts=time.time())
 
 
+def market_quote_cents(m: dict):
+    """Extract (yes_bid_cents, yes_ask_cents) from a Kalshi market object.
+
+    The current (elections) API expresses quotes as float *dollars* --
+    ``yes_ask_dollars: 0.87`` means 87c -- NOT the integer-cent ``yes_bid`` /
+    ``yes_ask`` fields the older API used. (Reading the old names is why the book
+    looked permanently empty.) Prefer the ``*_dollars`` fields, fall back to the
+    plain integer-cent fields, and derive a missing side from the NO book
+    (yes_ask = 100 - no_bid, yes_bid = 100 - no_ask). Returns cents ints or None.
+    """
+    def _cents(dollar_key, cent_key):
+        v = m.get(dollar_key)
+        if v is not None and v != "":
+            try:
+                return int(round(float(v) * 100))
+            except (TypeError, ValueError):
+                pass
+        v = m.get(cent_key)
+        try:
+            return int(v)
+        except (TypeError, ValueError):
+            return None
+
+    yb = _cents("yes_bid_dollars", "yes_bid")
+    ya = _cents("yes_ask_dollars", "yes_ask")
+    if ya is None:
+        nb = _cents("no_bid_dollars", "no_bid")
+        ya = (100 - nb) if nb is not None else None
+    if yb is None:
+        na = _cents("no_ask_dollars", "no_ask")
+        yb = (100 - na) if na is not None else None
+    return yb, ya
+
+
 # --------------------------------------------------------------------------- #
 # REST client (429 backoff + jitter, structured logging)
 # --------------------------------------------------------------------------- #
@@ -620,8 +654,7 @@ class KalshiClient:
         """
         try:
             m = self.get_market(ticker)
-            yb = int(m.get("yes_bid") or 0)
-            ya = int(m.get("yes_ask") or 0)
+            yb, ya = market_quote_cents(m)
             top = TopOfBook(yes_bid=yb or None, yes_ask=ya or None, ts=time.time())
             if top.valid:
                 return top
@@ -746,7 +779,13 @@ def resolve_active_ticker(client: KalshiClient, series_ticker: str,
         except (IndexError, ValueError):
             return None
 
-    quoted = [m for m in hour if _int(m.get("yes_bid")) and _int(m.get("yes_ask"))]
+    def _norm(m):
+        """Attach integer-cent yes_bid/yes_ask (from the *_dollars fields)."""
+        yb, ya = market_quote_cents(m)
+        return {**m, "yes_bid": yb or 0, "yes_ask": ya or 0}
+
+    quoted = [_norm(m) for m in hour]
+    quoted = [m for m in quoted if m["yes_ask"]]  # need an ask to trade/select
 
     # The /markets LIST omits live quotes for KXBTCD, and a single hour has 200+
     # strikes -- most deep in/out-of-the-money with empty books. For a "BTC above
@@ -769,8 +808,8 @@ def resolve_active_ticker(client: KalshiClient, series_ticker: str,
                 mk = client.get_market(m["ticker"])
             except Exception:
                 return None
-            yb, ya = _int(mk.get("yes_bid")), _int(mk.get("yes_ask"))
-            return {**m, "yes_bid": yb, "yes_ask": ya} if yb and ya else None
+            yb, ya = market_quote_cents(mk)
+            return {**m, "yes_bid": yb or 0, "yes_ask": ya or 0} if ya else None
 
         lo, hi, seen = 0, len(ladder) - 1, set()
         while lo <= hi and probes < 16:
@@ -810,7 +849,7 @@ def resolve_active_ticker(client: KalshiClient, series_ticker: str,
     else:
         # Nothing quoted anywhere in the ladder -- e.g. thin weekend / overnight
         # books. Log a sample and watch a real market so the loop stays healthy.
-        s = max(hour, key=lambda m: _int(m.get("volume")))
+        s = max(hour, key=lambda m: float(m.get("volume_fp") or m.get("volume") or 0))
         log_kv(logger, logging.WARNING, "no quoted market in ladder (thin book?)",
                ticker=s.get("ticker"), strikes=len(hour), probed=probes,
                status=s.get("status"))

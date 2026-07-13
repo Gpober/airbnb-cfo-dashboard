@@ -283,6 +283,28 @@ def _test_get_top_from_market(chk):
     chk.eq("get_top falls back to orderbook", (top2.yes_bid, top2.yes_ask), (70, 89))
 
 
+def _test_quote_fields(chk):
+    # The live API returns *_dollars floats (0.87 == 87c), not integer yes_bid/ask.
+    chk.eq("reads *_dollars quote",
+           bot.market_quote_cents({"yes_bid_dollars": 0.85, "yes_ask_dollars": 0.88}),
+           (85, 88))
+    # Falls back to legacy integer-cent fields.
+    chk.eq("falls back to integer cents",
+           bot.market_quote_cents({"yes_bid": 85, "yes_ask": 88}), (85, 88))
+    # Derives a missing YES side from the NO book.
+    chk.eq("derives yes from no side",
+           bot.market_quote_cents({"no_bid_dollars": 0.99, "no_ask_dollars": 1.00}),
+           (0, 1))
+    # The exact shape from a real KXBTCD dump (deep-OTM strike): yes_ask 1c.
+    real = {"yes_bid_dollars": 0.0000, "yes_ask_dollars": 0.0100,
+            "no_bid_dollars": 0.9900, "no_ask_dollars": 1.0000}
+    chk.eq("real KXBTCD field shape parses", bot.market_quote_cents(real), (0, 1))
+    # An in-band strike parses to a tradeable 87c ask.
+    chk.eq("in-band strike parses",
+           bot.market_quote_cents({"yes_bid_dollars": 0.86, "yes_ask_dollars": 0.87}),
+           (86, 87))
+
+
 def _test_market_selection(chk):
     cfg = bot.Config()  # entry band 85-90
 
@@ -793,6 +815,7 @@ def run_selftests(cfg=None, logger=None) -> int:
     _test_ws_desync(chk, cfg)
     _test_manage_dryrun(chk)
     _test_supabase_sink(chk)
+    _test_quote_fields(chk)
     _test_market_selection(chk)
     _test_get_top_from_market(chk)
     _test_ai_layer(chk)
