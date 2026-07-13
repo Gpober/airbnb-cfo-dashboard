@@ -2,7 +2,8 @@ import AutoRefresh from "@/components/AutoRefresh";
 import Controls from "@/components/Controls";
 import {
   configured, getLatestRun, getTrades, getLatestTick, getLatestPosition,
-  getAiDecisions, getSettings, computeStats, modeLabel, dollars, pct, type Trade,
+  getAiDecisions, getSettings, getBalanceCents, computeStats, modeLabel,
+  dollars, pct, type Trade,
 } from "@/lib/data";
 
 export const dynamic = "force-dynamic"; // always render fresh from Supabase
@@ -64,9 +65,9 @@ export default async function Page() {
     );
   }
 
-  const [run, trades, tick, position, ai, settings] = await Promise.all([
+  const [run, trades, tick, position, ai, settings, balanceCents] = await Promise.all([
     getLatestRun(), getTrades(), getLatestTick(), getLatestPosition(), getAiDecisions(),
-    getSettings(),
+    getSettings(), getBalanceCents(),
   ]);
   const stats = computeStats(trades);
   const mode = modeLabel(run);
@@ -97,6 +98,7 @@ export default async function Page() {
           {tick ? `${tick.ticker} — bid ${tick.yes_bid ?? "—"}¢ / ask ${tick.yes_ask ?? "—"}¢` : "waiting for first market tick"}
           {position && position.net_contracts !== 0 &&
             ` · open: ${position.net_contracts} @ ${position.avg_entry}¢`}
+          {balanceCents != null && ` · cash ${dollars(balanceCents)}`}
           {settings.entries_paused && " · ⏸ entries paused"}
         </span>
       </div>
@@ -105,6 +107,8 @@ export default async function Page() {
       <Controls
         target={settings.target_notional_usd}
         paused={settings.entries_paused}
+        takeProfit={settings.take_profit_cents}
+        stopLoss={settings.stop_loss_cents}
         updated={settings.updated ?? null}
       />
 

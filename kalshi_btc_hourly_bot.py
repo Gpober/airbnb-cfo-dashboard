@@ -1155,6 +1155,16 @@ class SupabaseSink:
         if row is not None:
             self._post("kalshi_trades", row, on_conflict="settle_key")
 
+    def record_balance(self, balance_cents: Optional[int],
+                       portfolio_cents: Optional[int] = None) -> None:
+        """Mirror the account's available cash so the dashboard shows it."""
+        if balance_cents is None:
+            return
+        self._post("kalshi_account", {
+            "id": 1, "balance_cents": balance_cents,
+            "portfolio_cents": portfolio_cents, "updated_at": _iso(time.time()),
+        }, on_conflict="id")
+
     def record_order(self, run_id: str, ticker: str, side: str, action: str,
                      count: int, price: Optional[int], client_order_id: str,
                      dry_run: bool, status: str = "submitted", raw: Optional[dict] = None) -> None:
@@ -1745,6 +1755,7 @@ def run_manage(cfg: Config, client: KalshiClient, signer: KalshiSigner,
             if sink and signer.ready and (now - last_settle_check) >= 60:
                 last_settle_check = now
                 capture_settlements(client, sink, run_id, logger, settle_seen)
+                sink.record_balance(client.get_balance_cents())
             hist = mem.snapshot_block() if mem is not None else None
             placed = False
 
