@@ -283,6 +283,27 @@ def _test_get_top_from_market(chk):
     chk.eq("get_top falls back to orderbook", (top2.yes_bid, top2.yes_ask), (70, 89))
 
 
+def _test_v2_order_body(chk):
+    cfg = bot.Config()  # DEMO+DRY_RUN -> not live, place_order returns the body
+    client = bot.KalshiClient(cfg, bot.KalshiSigner(cfg), logging.getLogger("t"))
+
+    # Buy YES at 89c -> V2 single-book "bid" with fixed-point dollar strings.
+    body = client.place_order("KXBTCD-T", "yes", "buy", 8, 89,
+                              client_order_id="coid-1")["order"]
+    chk.eq("v2 buy -> bid", body["side"], "bid")
+    chk.eq("v2 price is fixed-point dollars", body["price"], "0.8900")
+    chk.eq("v2 count is a string int", body["count"], "8")
+    chk.eq("v2 keeps ticker", body["ticker"], "KXBTCD-T")
+    chk.eq("v2 carries client_order_id", body["client_order_id"], "coid-1")
+    chk.ok("v2 has time_in_force", body.get("time_in_force") == "good_till_canceled")
+    chk.ok("v2 body is flat (no yes_price)", "yes_price" not in body and "action" not in body)
+
+    # Sell YES (exit) -> "ask".
+    sell = client.place_order("KXBTCD-T", "yes", "sell", 8, 99)["order"]
+    chk.eq("v2 sell -> ask", sell["side"], "ask")
+    chk.eq("v2 sell price", sell["price"], "0.9900")
+
+
 def _test_quote_fields(chk):
     # The live API returns *_dollars floats (0.87 == 87c), not integer yes_bid/ask.
     chk.eq("reads *_dollars quote",
@@ -816,6 +837,7 @@ def run_selftests(cfg=None, logger=None) -> int:
     _test_manage_dryrun(chk)
     _test_supabase_sink(chk)
     _test_quote_fields(chk)
+    _test_v2_order_body(chk)
     _test_market_selection(chk)
     _test_get_top_from_market(chk)
     _test_ai_layer(chk)

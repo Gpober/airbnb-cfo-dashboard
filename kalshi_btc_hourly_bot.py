@@ -697,25 +697,30 @@ class KalshiClient:
     def place_order(self, ticker: str, side: str, action: str, count: int,
                     price_cents: int, order_type: str = "limit",
                     client_order_id: Optional[str] = None) -> dict:
-        """Place an order. NO-OP unless live orders are explicitly enabled.
+        """Place an order via Kalshi's **V2 create-order** endpoint.
 
-        ``side`` is 'yes'/'no', ``action`` is 'buy'/'sell'. The returned dict
-        always carries ``client_order_id`` so callers can correlate the order
-        with its fills.
+        Callers still pass the legacy ``side`` ('yes'/'no') + ``action``
+        ('buy'/'sell') pair (that's what we log/record). V2 uses a single-book
+        model on the YES contract: **bid = buy it, ask = sell it**, with
+        fixed-point *dollar* strings for price and count (``0.8900`` == 89c).
+        The old ``/portfolio/orders`` path now returns 410 Gone.
         """
         coid = client_order_id or f"kbtc-{int(time.time()*1000)}-{random.randint(0, 9999)}"
+        v2_side = "bid" if action == "buy" else "ask"   # buy the YES contract / sell it
         body = {
             "ticker": ticker,
-            "action": action,
-            "side": side,
-            "count": count,
-            "type": order_type,
-            # client_order_id makes retries idempotent on Kalshi's side.
-            "client_order_id": coid,
+            "client_order_id": coid,   # makes retries idempotent on Kalshi's side
+            "side": v2_side,
+            "count": str(int(count)),
+            "price": f"{price_cents / 100:.4f}",        # fixed-point dollars
+            "time_in_force": "good_till_canceled",
+            "self_trade_prevention_type": "taker_at_cross",
+            "post_only": False,
+            "cancel_order_on_pause": False,
+            "reduce_only": False,
+            "subaccount": 0,
+            "exchange_index": 0,
         }
-        if order_type == "limit":
-            # Kalshi expects the limit price on the side being traded.
-            body["yes_price" if side == "yes" else "no_price"] = price_cents
 
         if not self.cfg.live_orders_enabled:
             log_kv(self.log, logging.INFO, "DRY-RUN order (not sent)",
@@ -724,8 +729,8 @@ class KalshiClient:
             return {"dry_run": True, "order": body}
 
         log_kv(self.log, logging.WARNING, "PLACING LIVE ORDER",
-               ticker=ticker, action=action, side=side, count=count, price_cents=price_cents)
-        return self._request("POST", "/portfolio/orders", signed=True, body={"order": body})
+               ticker=ticker, action=action, v2_side=v2_side, count=count, price_cents=price_cents)
+        return self._request("POST", "/portfolio/events/orders", signed=True, body=body)
 
 
 # --------------------------------------------------------------------------- #
