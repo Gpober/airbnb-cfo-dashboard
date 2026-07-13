@@ -1095,9 +1095,10 @@ class SupabaseSink:
             })
             log_kv(logger, logging.INFO, "supabase sink enabled", url=cfg.supabase_url)
 
-    def _post(self, table: str, row: dict, on_conflict: Optional[str] = None) -> None:
+    def _post(self, table: str, row: dict, on_conflict: Optional[str] = None) -> bool:
+        """POST a row; returns True on success so callers can retry on failure."""
         if not self.enabled:
-            return
+            return False
         params = {}
         headers = {"Prefer": "return=minimal"}
         if on_conflict:
@@ -1111,8 +1112,11 @@ class SupabaseSink:
             if resp.status_code >= 300:
                 log_kv(self.log, logging.WARNING, "supabase write failed",
                        table=table, status=resp.status_code, body=resp.text[:300])
+                return False
+            return True
         except requests.RequestException as exc:
             log_kv(self.log, logging.WARNING, "supabase unreachable", table=table, error=str(exc))
+            return False
 
     # -- typed helpers ---------------------------------------------------- #
 
@@ -1148,12 +1152,14 @@ class SupabaseSink:
             "opened_at": _iso(opened_ts), "closed_at": _iso(closed_ts),
         })
 
-    def record_settlement(self, run_id: str, s: dict) -> None:
+    def record_settlement(self, run_id: str, s: dict) -> bool:
         """Mirror a settled market (expiry outcome) as a closed trade with real
-        P&L, deduped by settle_key so restarts don't double-count."""
+        P&L, deduped by settle_key. Returns True when handled (recorded, or
+        unparseable) so the caller only marks it done on success."""
         row = settlement_to_trade(run_id, s)
-        if row is not None:
-            self._post("kalshi_trades", row, on_conflict="settle_key")
+        if row is None:
+            return True  # can't parse -> don't retry forever
+        return self._post("kalshi_trades", row, on_conflict="settle_key")
 
     def record_balance(self, balance_cents: Optional[int],
                        portfolio_cents: Optional[int] = None) -> None:
@@ -1601,9 +1607,10 @@ def capture_settlements(client: KalshiClient, sink, run_id: str,
         key = f"{s.get('ticker')}:{s.get('settled_time')}"
         if key in seen:
             continue
+        # Only mark done on a successful write, so a transient failure retries.
+        if sink and not sink.record_settlement(run_id, s):
+            continue
         seen.add(key)
-        if sink:
-            sink.record_settlement(run_id, s)
         log_kv(logger, logging.INFO, "settlement recorded",
                ticker=s.get("ticker"), result=s.get("market_result"),
                revenue_cents=_cents_field(s, "revenue_dollars", "revenue"))
