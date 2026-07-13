@@ -112,6 +112,8 @@ export async function getAiDecisions(limit = 15): Promise<AiDecision[]> {
 export type Settings = {
   target_notional_usd: number;
   entries_paused: boolean;
+  take_profit_cents: number;
+  stop_loss_cents: number;
   entry_min_cents?: number;
   entry_max_cents?: number;
   updated?: string | null;
@@ -130,10 +132,20 @@ export async function getSettings(): Promise<Settings> {
   return {
     target_notional_usd: num("target_notional_usd", 8),
     entries_paused: map.get("entries_paused")?.value === true,
+    take_profit_cents: num("take_profit_cents", 99),
+    stop_loss_cents: num("stop_loss_cents", 1),
     entry_min_cents: map.has("entry_min_cents") ? num("entry_min_cents", 85) : undefined,
     entry_max_cents: map.has("entry_max_cents") ? num("entry_max_cents", 90) : undefined,
     updated,
   };
+}
+
+export async function getBalanceCents(): Promise<number | null> {
+  const rows = await rest<{ balance_cents: number | null }>(
+    "kalshi_account?select=balance_cents&id=eq.1",
+  );
+  const v = rows[0]?.balance_cents;
+  return typeof v === "number" ? v : null;
 }
 
 // -- derived stats ---------------------------------------------------------- //
