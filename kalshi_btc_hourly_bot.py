@@ -1824,6 +1824,25 @@ def run_diagnose(client: "KalshiClient", cfg: Config, logger: logging.Logger) ->
     return 0
 
 
+def run_diagnose_portfolio(client: "KalshiClient", cfg: Config,
+                           logger: logging.Logger) -> int:
+    """Dump the RAW shape of the account endpoints so we can mirror the real
+    Kalshi account (balance, open positions, settlements, fills) to the
+    dashboard exactly -- no guessing at field names. Read-only."""
+    print(f"\n=== PORTFOLIO DIAGNOSE @ {cfg.base_url} (auth={client.signer.ready}) ===")
+    for path in ("/portfolio/balance",
+                 "/portfolio/positions",
+                 "/portfolio/settlements?limit=5",
+                 "/portfolio/fills?limit=5"):
+        print(f"\n----- GET {path} -----")
+        try:
+            data = client._request("GET", path, signed=True)
+            print(json.dumps(data, indent=2, default=str)[:2500])
+        except Exception as exc:
+            print(f"ERROR: {exc}")
+    return 0
+
+
 def _banner(cfg: Config, logger: logging.Logger) -> None:
     mode = "LIVE-REAL-MONEY" if cfg.live_orders_enabled else (
         "DEMO" if cfg.demo else "PROD") + ("+DRY_RUN" if cfg.dry_run else "")
@@ -1850,6 +1869,8 @@ def main(argv: Optional[list] = None) -> int:
                         help="run offline self-tests (no network)")
     parser.add_argument("--diagnose", action="store_true",
                         help="dump raw Kalshi quotes across the strike ladder and exit")
+    parser.add_argument("--diagnose-portfolio", action="store_true",
+                        help="dump raw account balance/positions/settlements/fills and exit")
     parser.add_argument("--cycles", type=int, default=120,
                         help="paper/manage cycles to run (default 120)")
     parser.add_argument("--interval", type=float, default=None,
@@ -1879,6 +1900,9 @@ def main(argv: Optional[list] = None) -> int:
 
     if args.diagnose:
         return run_diagnose(client, cfg, logger)
+
+    if args.diagnose_portfolio:
+        return run_diagnose_portfolio(client, cfg, logger)
 
     if args.report:
         log = TradeLog(cfg.db_path)
