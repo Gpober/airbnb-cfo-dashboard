@@ -421,6 +421,20 @@ def _test_market_selection(chk):
             ask = max(1, min(99, 99 - i))        # monotonic: low strike -> dear YES
             return {"yes_bid": ask - 2, "yes_ask": ask}
 
+    # Multi-hour scan: the soonest hour is degenerate (99c/2c, no in-band strike),
+    # but a LATER hour has a real 85-90c opportunity -> the bot must find it there
+    # instead of sitting idle on the soonest hour.
+    class _MultiHour:
+        def get_all_markets(self, **kw):
+            return [
+                {"ticker": "KX-H1-T1", "close_time": "2026-07-11T18:00:00Z", "yes_bid": 98, "yes_ask": 99},
+                {"ticker": "KX-H1-T2", "close_time": "2026-07-11T18:00:00Z", "yes_bid": 1, "yes_ask": 2},
+                {"ticker": "KX-H2-T9", "close_time": "2026-07-11T19:00:00Z", "yes_bid": 86, "yes_ask": 88},
+            ]
+    chk.eq("scans a later hour for an in-band opportunity",
+           bot.resolve_active_ticker(_MultiHour(), "KXBTCD", logging.getLogger("t"), cfg),
+           "KX-H2-T9")
+
     big = _BigLadder()
     picked = bot.resolve_active_ticker(big, "KXBTCD", logging.getLogger("t"), cfg)
     picked_strike = float(picked.rsplit("-T", 1)[1])

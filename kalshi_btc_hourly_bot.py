@@ -136,6 +136,10 @@ class Config:
     # --- Strategy knobs (cents) ------------------------------------------- #
     entry_min_cents: int = field(default_factory=lambda: _env_int("KALSHI_ENTRY_MIN_CENTS", 85))
     entry_max_cents: int = field(default_factory=lambda: _env_int("KALSHI_ENTRY_MAX_CENTS", 90))
+    # How many upcoming hourly contracts to scan for an entry opportunity (not
+    # just the soonest-closing one). Higher = more chances to enter, at the cost
+    # of a few more quote probes per lookup.
+    scan_hours: int = field(default_factory=lambda: _env_int("KALSHI_SCAN_HOURS", 3))
     target_notional_usd: float = field(
         default_factory=lambda: _env_float("KALSHI_TARGET_NOTIONAL_USD", 1000.0)
     )
@@ -756,75 +760,36 @@ class KalshiClient:
 # --------------------------------------------------------------------------- #
 
 
-def resolve_active_ticker(client: KalshiClient, series_ticker: str,
-                          logger: logging.Logger,
-                          cfg: Optional[Config] = None) -> Optional[str]:
-    """Select the tradeable market in ``series_ticker`` for this hour.
-
-    KXBTCD is a *strike ladder*: each hour has many strike markets, and most
-    are illiquid with empty books. Picking the first by close-time (the old
-    behaviour) lands on a dead strike. Instead, within the soonest-closing
-    hour, use the quotes Kalshi returns in ``GET /markets`` to pick a market
-    that is actually trading -- preferring one whose YES ask is inside the
-    entry band, else the most liquid quoted strike. Returns None on error so
-    callers degrade gracefully.
-    """
+def _int_cent(v) -> int:
     try:
-        markets = client.get_all_markets(series_ticker=series_ticker, status="open")
-    except Exception as exc:
-        log_kv(logger, logging.ERROR, "market lookup failed",
-               series=series_ticker, error=str(exc))
-        return None
-    if not markets:
-        log_kv(logger, logging.WARNING, "no open markets", series=series_ticker)
-        return None
+        return int(v)
+    except (TypeError, ValueError):
+        return 0
 
-    # Restrict to the currently-active hour (soonest close time).
-    soonest = min((m.get("close_time", "") for m in markets if m.get("close_time")),
-                  default="")
-    hour = [m for m in markets if m.get("close_time", "") == soonest] or markets
 
-    # Markets with a real two-sided quote (yes_bid and yes_ask are cents; 0/None
-    # means no quote). These are the only ones worth watching or trading.
-    def _int(v):
-        try:
-            return int(v)
-        except (TypeError, ValueError):
-            return 0
-
-    def _band(m):
-        return cfg is not None and cfg.entry_min_cents <= _int(m.get("yes_ask")) <= cfg.entry_max_cents
+def _select_in_hour(client: KalshiClient, hour: list, cfg: Optional[Config]):
+    """Within ONE hour's strike ladder, find the strike whose YES ask is in the
+    entry band (or the nearest-to-band quoted strike). Binary-searches the
+    ladder (YES ask falls monotonically as strike rises) so it homes in on the
+    near-the-money strikes in ~log2(strikes) probes. Returns
+    ``(pick_or_None, in_band_bool, quoted_count)``.
+    """
+    lo_c = cfg.entry_min_cents if cfg else 85
+    hi_c = cfg.entry_max_cents if cfg else 90
 
     def _strike(m):
-        # Strike is encoded in the ticker suffix, e.g. ...-T73299.99.
         try:
             return float(m.get("ticker", "").rsplit("-T", 1)[1])
         except (IndexError, ValueError):
             return None
 
     def _norm(m):
-        """Attach integer-cent yes_bid/yes_ask (from the *_dollars fields)."""
         yb, ya = market_quote_cents(m)
         return {**m, "yes_bid": yb or 0, "yes_ask": ya or 0}
 
-    quoted = [_norm(m) for m in hour]
-    quoted = [m for m in quoted if m["yes_ask"]]  # need an ask to trade/select
-
-    # The /markets LIST omits live quotes for KXBTCD, and a single hour has 200+
-    # strikes -- most deep in/out-of-the-money with empty books. For a "BTC above
-    # $X" contract the YES ask falls monotonically as the strike rises (a higher
-    # bar is less likely), so rather than blindly sampling the whole ladder we
-    # BINARY-SEARCH it for the strike whose YES ask lands in the entry band. That
-    # homes straight in on the near-the-money strikes -- where the 85-90c action
-    # and the liquidity are -- in ~log2(strikes) probes, and never wastes probes
-    # on the deep-ITM/OTM tails (the old even-sampling could land on a dead strike
-    # $9k away from spot). Empty strikes are skipped by scanning outward to the
-    # nearest quoted neighbour, so a thin book still resolves.
-    probes = 0
+    quoted = [m for m in map(_norm, hour) if m["yes_ask"]]  # need an ask to trade
     if not quoted:
         ladder = sorted((m for m in hour if _strike(m) is not None), key=_strike)
-        lo_c = cfg.entry_min_cents if cfg else 85
-        hi_c = cfg.entry_max_cents if cfg else 90
 
         def _probe(m):
             try:
@@ -834,7 +799,7 @@ def resolve_active_ticker(client: KalshiClient, series_ticker: str,
             yb, ya = market_quote_cents(mk)
             return {**m, "yes_bid": yb or 0, "yes_ask": ya or 0} if ya else None
 
-        lo, hi, seen = 0, len(ladder) - 1, set()
+        lo, hi, seen, probes = 0, len(ladder) - 1, set(), 0
         while lo <= hi and probes < 16:
             mid = (lo + hi) // 2
             hit = None
@@ -853,7 +818,7 @@ def resolve_active_ticker(client: KalshiClient, series_ticker: str,
                 break
             j, q = hit
             quoted.append(q)
-            ask = _int(q.get("yes_ask"))
+            ask = _int_cent(q.get("yes_ask"))
             if lo_c <= ask <= hi_c:
                 break                                # found the money -> stop
             if ask > hi_c:
@@ -861,27 +826,70 @@ def resolve_active_ticker(client: KalshiClient, series_ticker: str,
             else:
                 hi = j - 1                           # YES too cheap -> strike too high
 
-    in_band = [m for m in quoted if _band(m)]
+    in_band = [m for m in quoted if lo_c <= _int_cent(m.get("yes_ask")) <= hi_c]
     if in_band:
-        pick = in_band[0]
-    elif quoted:
-        # No exact in-band strike right now: watch the quoted strike nearest the
-        # band (near-the-money) so ticks flow and we catch it entering the band.
-        mid = (cfg.entry_min_cents + cfg.entry_max_cents) / 2 if cfg else 50
-        pick = min(quoted, key=lambda m: abs(_int(m.get("yes_ask")) - mid))
-    else:
-        # Nothing quoted anywhere in the ladder -- e.g. thin weekend / overnight
-        # books. Log a sample and watch a real market so the loop stays healthy.
-        s = max(hour, key=lambda m: float(m.get("volume_fp") or m.get("volume") or 0))
-        log_kv(logger, logging.WARNING, "no quoted market in ladder (thin book?)",
-               ticker=s.get("ticker"), strikes=len(hour), probed=probes,
-               status=s.get("status"))
-        pick = s
+        return in_band[0], True, len(quoted)
+    if quoted:
+        mid = (lo_c + hi_c) / 2
+        return min(quoted, key=lambda m: abs(_int_cent(m.get("yes_ask")) - mid)), False, len(quoted)
+    return None, False, 0
 
-    log_kv(logger, logging.INFO, "selected market", ticker=pick["ticker"],
-           yes_bid=pick.get("yes_bid"), yes_ask=pick.get("yes_ask"),
-           in_band=bool(in_band), quoted=len(quoted), open_markets=len(markets))
-    return pick["ticker"]
+
+def resolve_active_ticker(client: KalshiClient, series_ticker: str,
+                          logger: logging.Logger,
+                          cfg: Optional[Config] = None) -> Optional[str]:
+    """Pick the best tradeable market across the next few hours.
+
+    Every hour's contract opens ~a day early, so several hours are tradeable at
+    once. Rather than watch only the soonest-closing hour (which is often
+    near-expiry and degenerate -- everything 99c/1c), scan the nearest
+    ``KALSHI_SCAN_HOURS`` hours and return the FIRST one with an in-band strike
+    (preferring soonest = least time for a reversal). If none is in-band, fall
+    back to the nearest-to-band quoted strike. Returns None on error.
+    """
+    try:
+        markets = client.get_all_markets(series_ticker=series_ticker, status="open")
+    except Exception as exc:
+        log_kv(logger, logging.ERROR, "market lookup failed",
+               series=series_ticker, error=str(exc))
+        return None
+    if not markets:
+        log_kv(logger, logging.WARNING, "no open markets", series=series_ticker)
+        return None
+
+    # Group by hour (close_time), soonest first.
+    by_hour: dict = {}
+    for m in markets:
+        ct = m.get("close_time", "")
+        if ct:
+            by_hour.setdefault(ct, []).append(m)
+    ordered = [by_hour[k] for k in sorted(by_hour)] or [markets]
+    scan = max(1, int(getattr(cfg, "scan_hours", 3))) if cfg else 3
+
+    fallback = None
+    for hour in ordered[:scan]:
+        pick, in_band, qc = _select_in_hour(client, hour, cfg)
+        if in_band and pick:
+            log_kv(logger, logging.INFO, "selected market", ticker=pick["ticker"],
+                   yes_bid=pick.get("yes_bid"), yes_ask=pick.get("yes_ask"),
+                   in_band=True, quoted=qc, close_time=hour[0].get("close_time"),
+                   open_markets=len(markets))
+            return pick["ticker"]
+        if fallback is None and pick:
+            fallback = (pick, qc, hour[0].get("close_time"))
+
+    if fallback:
+        pick, qc, ct = fallback
+        log_kv(logger, logging.INFO, "selected market", ticker=pick["ticker"],
+               yes_bid=pick.get("yes_bid"), yes_ask=pick.get("yes_ask"),
+               in_band=False, quoted=qc, close_time=ct, open_markets=len(markets))
+        return pick["ticker"]
+
+    # Nothing quoted anywhere across the scanned hours (thin book).
+    s = max(ordered[0], key=lambda m: float(m.get("volume_fp") or m.get("volume") or 0))
+    log_kv(logger, logging.WARNING, "no quoted market in any scanned hour (thin book?)",
+           ticker=s.get("ticker"), scanned_hours=min(scan, len(ordered)))
+    return s.get("ticker")
 
 
 # --------------------------------------------------------------------------- #
@@ -1666,14 +1674,19 @@ def run_manage(cfg: Config, client: KalshiClient, signer: KalshiSigner,
         while cycles is None or i < cycles:
             i += 1
 
-            # --- hourly rollover: follow the active market ----------------- #
-            if rollover and (time.time() - last_roll_check) >= cfg.rollover_check_sec:
+            # --- follow the best opportunity across hours ------------------ #
+            # Re-hunt for the best market ONLY while flat. While holding a
+            # position we stay on its ticker so switching to a later hour can
+            # never abandon an open position (it would go unmanaged until it
+            # settled). Once the position closes (pos -> None), we re-scan and
+            # move to wherever the next in-band strike is.
+            if rollover and pos is None and (time.time() - last_roll_check) >= cfg.rollover_check_sec:
                 last_roll_check = time.time()
                 new_ticker = resolve_active_ticker(client, cfg.series_ticker, logger, cfg)
                 if new_ticker and new_ticker != ticker:
-                    log_kv(logger, logging.INFO, "ticker rollover",
+                    log_kv(logger, logging.INFO, "switching market",
                            old=ticker, new=new_ticker)
-                    ticker, pos, pending_until = new_ticker, None, 0.0
+                    ticker, pending_until = new_ticker, 0.0
                     ws_ok = connect(ticker)
 
             if ticker is None:  # forever mode, waiting for a market to open
