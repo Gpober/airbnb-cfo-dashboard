@@ -1696,6 +1696,62 @@ def run_manage(cfg: Config, client: KalshiClient, signer: KalshiSigner,
 # --------------------------------------------------------------------------- #
 
 
+def run_diagnose(client: "KalshiClient", cfg: Config, logger: logging.Logger) -> int:
+    """Dump the RAW Kalshi quote data across the strike ladder so we can tell,
+    definitively, whether the book is genuinely empty or we're misreading it."""
+    print(f"\n=== DIAGNOSE {cfg.series_ticker} @ {cfg.base_url} ===")
+    print(f"signer ready (authenticated): {client.signer.ready}")
+    markets = client.get_all_markets(series_ticker=cfg.series_ticker, status="open")
+    print(f"open markets: {len(markets)}")
+    if not markets:
+        print("no open markets returned -- nothing to inspect.")
+        return 0
+
+    soonest = min((m.get("close_time", "") for m in markets if m.get("close_time")),
+                  default="")
+    hour = [m for m in markets if m.get("close_time", "") == soonest] or markets
+    print(f"soonest close_time: {soonest}   markets in that hour: {len(hour)}")
+
+    def _strike(m):
+        try:
+            return float(m.get("ticker", "").rsplit("-T", 1)[1])
+        except (IndexError, ValueError):
+            return None
+
+    ladder = sorted((m for m in hour if _strike(m) is not None), key=_strike)
+    if ladder:
+        print(f"strike range: {_strike(ladder[0]):.0f} .. {_strike(ladder[-1]):.0f} "
+              f"({len(ladder)} strikes)")
+        # Show ALL fields of one market so we can spot any quote field we miss.
+        print(f"\nfull field dump of one market ({ladder[len(ladder)//2]['ticker']}):")
+        sample = client.get_market(ladder[len(ladder) // 2]["ticker"])
+        for k, v in sample.items():
+            print(f"    {k}: {v}")
+
+    # Probe ~7 strikes evenly spread across the ladder: market quote + raw orderbook.
+    targets = ladder or hour
+    n = len(targets)
+    idxs = sorted(set(int(i * (n - 1) / 6) for i in range(7))) if n > 1 else [0]
+    print("\nper-strike quotes (market object + orderbook endpoint):")
+    for i in idxs:
+        t = targets[i]["ticker"]
+        try:
+            mk = client.get_market(t)
+        except Exception as exc:
+            print(f"  {t}: get_market ERROR {exc}")
+            continue
+        try:
+            ob = client.get_orderbook(t, depth=2)
+        except Exception as exc:
+            ob = f"ERROR {exc}"
+        print(f"  strike {_strike(targets[i])} {t}")
+        print(f"      market: yes_bid={mk.get('yes_bid')} yes_ask={mk.get('yes_ask')} "
+              f"last_price={mk.get('last_price')} volume={mk.get('volume')} "
+              f"open_interest={mk.get('open_interest')} status={mk.get('status')}")
+        print(f"      orderbook: {ob}")
+    return 0
+
+
 def _banner(cfg: Config, logger: logging.Logger) -> None:
     mode = "LIVE-REAL-MONEY" if cfg.live_orders_enabled else (
         "DEMO" if cfg.demo else "PROD") + ("+DRY_RUN" if cfg.dry_run else "")
@@ -1720,6 +1776,8 @@ def main(argv: Optional[list] = None) -> int:
                         help="print the SQLite paper-trade summary and exit")
     parser.add_argument("--selftest", action="store_true",
                         help="run offline self-tests (no network)")
+    parser.add_argument("--diagnose", action="store_true",
+                        help="dump raw Kalshi quotes across the strike ladder and exit")
     parser.add_argument("--cycles", type=int, default=120,
                         help="paper/manage cycles to run (default 120)")
     parser.add_argument("--interval", type=float, default=None,
@@ -1746,6 +1804,9 @@ def main(argv: Optional[list] = None) -> int:
     mem = PerformanceMemory(cfg, logger, sink)
     controls = RemoteSettings(cfg, logger, sink)
     interval = args.interval if args.interval is not None else cfg.poll_interval_sec
+
+    if args.diagnose:
+        return run_diagnose(client, cfg, logger)
 
     if args.report:
         log = TradeLog(cfg.db_path)
