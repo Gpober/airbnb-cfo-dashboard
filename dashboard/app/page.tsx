@@ -150,7 +150,8 @@ export default async function Page() {
             </thead>
             <tbody>
               {recent.map((t: Trade) => {
-                const tagCls = t.reason === "take_profit" ? "tp" : t.reason === "stop_loss" ? "sl" : "so";
+                const tagCls = t.reason === "take_profit" ? "tp" : t.reason === "stop_loss" ? "sl"
+                  : t.reason === "settled" ? "settled" : "so";
                 return (
                   <tr key={t.id}>
                     <td>{ago(t.closed_at)}</td>

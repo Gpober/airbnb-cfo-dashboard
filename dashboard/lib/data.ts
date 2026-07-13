@@ -38,7 +38,7 @@ export type Trade = {
   id: number;
   run_id: string;
   ticker: string;
-  reason: "take_profit" | "stop_loss" | "scale_out";
+  reason: "take_profit" | "stop_loss" | "scale_out" | "settled";
   contracts: number;
   entry_price: number;
   exit_price: number;

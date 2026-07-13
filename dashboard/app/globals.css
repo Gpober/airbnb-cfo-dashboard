@@ -82,6 +82,7 @@ tbody tr:hover { background: var(--panel-2); }
 .tag.hold { background: rgba(136,153,166,0.15); color: var(--muted); }
 .tag.exit { background: rgba(239,68,68,0.15); color: #fca5a5; }
 .tag.scale_out { background: rgba(245,158,11,0.15); color: #fcd34d; }
+.tag.settled { background: rgba(59,130,246,0.15); color: #93c5fd; }
 
 .empty {
   border: 1px dashed var(--border); border-radius: 12px; padding: 36px 20px;
