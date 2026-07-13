@@ -490,6 +490,23 @@ def top_from_orderbook(ob: dict) -> TopOfBook:
     return TopOfBook(yes_bid=yes_bid, yes_ask=yes_ask, ts=time.time())
 
 
+def _cents_field(d: dict, dollar_key: str, cent_key: str):
+    """Read a price/fee as integer cents, handling the API's float-*dollars*
+    fields (0.87 -> 87) with a fallback to the legacy integer-cent field.
+    Returns None if neither is present/parseable."""
+    v = d.get(dollar_key)
+    if v is not None and v != "":
+        try:
+            return int(round(float(v) * 100))
+        except (TypeError, ValueError):
+            pass
+    v = d.get(cent_key)
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return None
+
+
 def market_quote_cents(m: dict):
     """Extract (yes_bid_cents, yes_ask_cents) from a Kalshi market object.
 
@@ -500,26 +517,13 @@ def market_quote_cents(m: dict):
     plain integer-cent fields, and derive a missing side from the NO book
     (yes_ask = 100 - no_bid, yes_bid = 100 - no_ask). Returns cents ints or None.
     """
-    def _cents(dollar_key, cent_key):
-        v = m.get(dollar_key)
-        if v is not None and v != "":
-            try:
-                return int(round(float(v) * 100))
-            except (TypeError, ValueError):
-                pass
-        v = m.get(cent_key)
-        try:
-            return int(v)
-        except (TypeError, ValueError):
-            return None
-
-    yb = _cents("yes_bid_dollars", "yes_bid")
-    ya = _cents("yes_ask_dollars", "yes_ask")
+    yb = _cents_field(m, "yes_bid_dollars", "yes_bid")
+    ya = _cents_field(m, "yes_ask_dollars", "yes_ask")
     if ya is None:
-        nb = _cents("no_bid_dollars", "no_bid")
+        nb = _cents_field(m, "no_bid_dollars", "no_bid")
         ya = (100 - nb) if nb is not None else None
     if yb is None:
-        na = _cents("no_ask_dollars", "no_ask")
+        na = _cents_field(m, "no_ask_dollars", "no_ask")
         yb = (100 - na) if na is not None else None
     return yb, ya
 
@@ -1476,9 +1480,21 @@ def reconcile_position_from_fills(client: KalshiClient, ticker: str,
     for f in fills:
         side = f.get("side", "yes")
         action = f.get("action")  # buy | sell
-        count = int(f.get("count", 0))
-        price = int(f.get("yes_price") if side == "yes" else 100 - int(f.get("no_price", 0)))
-        fee_total += int(f.get("fee", 0) or 0)
+        # Prices/fees now come as *_dollars floats (0.87 == 87c); count may be a
+        # fixed-point string ("8.00"). Parse defensively so one odd fill can't
+        # crash reconciliation.
+        try:
+            count = int(float(f.get("count") or 0))
+        except (TypeError, ValueError):
+            continue
+        if side == "yes":
+            price = _cents_field(f, "yes_price_dollars", "yes_price")
+        else:
+            npx = _cents_field(f, "no_price_dollars", "no_price")
+            price = (100 - npx) if npx is not None else None
+        if price is None or count <= 0:
+            continue
+        fee_total += _cents_field(f, "fee_dollars", "fee") or 0
         signed = count if action == "buy" else -count
         # Only track net YES exposure for this simple single-market strategy.
         if side == "no":
