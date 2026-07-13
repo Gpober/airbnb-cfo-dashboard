@@ -1670,18 +1670,24 @@ def run_manage(cfg: Config, client: KalshiClient, signer: KalshiSigner,
                         coid = f"kbtc-{int(now*1000)}-{random.randint(0, 9999)}"
                         log_kv(logger, logging.INFO, "entry signal",
                                price=top.yes_ask, qty=qty, source=source, why=why)
-                        resp = client.place_order(ticker, "yes", "buy", qty,
-                                                  top.yes_ask, client_order_id=coid)
-                        placed = True
-                        if sink:
-                            sink.record_order(run_id, ticker, "yes", "buy", qty,
-                                              top.yes_ask, coid, dry_run=not live, raw=resp)
-                        if not live:
-                            # Simulate the fill so the lifecycle is observable.
-                            fee = kalshi_fee_cents(qty, top.yes_ask, cfg)
-                            pos = Position(ticker=ticker, contracts=qty,
-                                           entry_price_cents=top.yes_ask,
-                                           entry_fee_cents=fee, opened_ts=now, remaining=qty)
+                        try:
+                            resp = client.place_order(ticker, "yes", "buy", qty,
+                                                      top.yes_ask, client_order_id=coid)
+                        except Exception as exc:
+                            log_kv(logger, logging.ERROR,
+                                   "entry order failed (continuing)", error=str(exc))
+                            resp = None
+                        if resp is not None:
+                            placed = True
+                            if sink:
+                                sink.record_order(run_id, ticker, "yes", "buy", qty,
+                                                  top.yes_ask, coid, dry_run=not live, raw=resp)
+                            if not live:
+                                # Simulate the fill so the lifecycle is observable.
+                                fee = kalshi_fee_cents(qty, top.yes_ask, cfg)
+                                pos = Position(ticker=ticker, contracts=qty,
+                                               entry_price_cents=top.yes_ask,
+                                               entry_fee_cents=fee, opened_ts=now, remaining=qty)
             else:
                 decision = decide_exit(pos, top, cfg)
                 # AI overlay: may bring an exit FORWARD (rules' stop/TP still apply).
@@ -1704,18 +1710,24 @@ def run_manage(cfg: Config, client: KalshiClient, signer: KalshiSigner,
                     coid = f"kbtc-{int(now*1000)}-{random.randint(0, 9999)}"
                     log_kv(logger, logging.INFO, "exit signal",
                            reason=reason, price=sell_price, qty=qty, source=source)
-                    resp = client.place_order(ticker, "yes", "sell", qty,
-                                              sell_price, client_order_id=coid)
-                    placed = True
-                    if sink:
-                        sink.record_order(run_id, ticker, "yes", "sell", qty,
-                                          sell_price, coid, dry_run=not live, raw=resp)
-                    if not live:
-                        pos.remaining -= qty
-                        if reason == "scale_out":
-                            pos.scaled_out = True
-                        if pos.remaining <= 0:
-                            pos = None
+                    try:
+                        resp = client.place_order(ticker, "yes", "sell", qty,
+                                                  sell_price, client_order_id=coid)
+                    except Exception as exc:
+                        log_kv(logger, logging.ERROR,
+                               "exit order failed (will retry next cycle)", error=str(exc))
+                        resp = None
+                    if resp is not None:
+                        placed = True
+                        if sink:
+                            sink.record_order(run_id, ticker, "yes", "sell", qty,
+                                              sell_price, coid, dry_run=not live, raw=resp)
+                        if not live:
+                            pos.remaining -= qty
+                            if reason == "scale_out":
+                                pos.scaled_out = True
+                            if pos.remaining <= 0:
+                                pos = None
 
             # After a live order, hold off until the grace window passes so a
             # resting limit is not resubmitted before the next fills read.
