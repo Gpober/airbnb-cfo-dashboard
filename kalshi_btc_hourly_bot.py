@@ -698,6 +698,20 @@ class KalshiClient:
         data = self._request("GET", path, signed=True)
         return data.get("market_positions", [])
 
+    def get_settlements(self, limit: int = 50) -> list:
+        """Recently settled markets (expiry outcomes) with realized revenue."""
+        data = self._request("GET", f"/portfolio/settlements?limit={limit}", signed=True)
+        return data.get("settlements", [])
+
+    def get_balance_cents(self) -> Optional[int]:
+        """Available cash in cents, or None on error."""
+        try:
+            data = self._request("GET", "/portfolio/balance", signed=True)
+        except Exception:
+            return None
+        c = _cents_field(data, "balance_dollars", "balance")
+        return c
+
     def place_order(self, ticker: str, side: str, action: str, count: int,
                     price_cents: int, order_type: str = "limit",
                     client_order_id: Optional[str] = None) -> dict:
@@ -1126,6 +1140,13 @@ class SupabaseSink:
             "opened_at": _iso(opened_ts), "closed_at": _iso(closed_ts),
         })
 
+    def record_settlement(self, run_id: str, s: dict) -> None:
+        """Mirror a settled market (expiry outcome) as a closed trade with real
+        P&L, deduped by settle_key so restarts don't double-count."""
+        row = settlement_to_trade(run_id, s)
+        if row is not None:
+            self._post("kalshi_trades", row, on_conflict="settle_key")
+
     def record_order(self, run_id: str, ticker: str, side: str, action: str,
                      count: int, price: Optional[int], client_order_id: str,
                      dry_run: bool, status: str = "submitted", raw: Optional[dict] = None) -> None:
@@ -1466,53 +1487,108 @@ class WebSocketFeed:
 
 def reconcile_position_from_fills(client: KalshiClient, ticker: str,
                                   logger: logging.Logger) -> Optional[Position]:
-    """Reconstruct the real net YES position for ``ticker`` from actual fills.
+    """Read the authoritative open position for ``ticker`` from
+    ``GET /portfolio/positions``.
 
-    We do NOT assume our orders filled; we read ``GET /portfolio/fills`` and
-    net buys against sells. Returns a :class:`Position` (with a size-weighted
-    average entry) or None if flat.
+    Kalshi's positions endpoint is the source of truth: it gives the net
+    ``position_fp`` (contracts) and the remaining ``market_exposure_dollars``
+    cost basis directly, so we don't have to replay fills (which can drift, and
+    whose field names have churned). Returns a :class:`Position` or None if flat.
+    (Kept the historical name for existing call sites.)
     """
-    fills = client.get_fills(ticker=ticker)
-    net = 0
-    cost = 0  # cents, signed, of open YES exposure
-    fee_total = 0
-    opened_ts = time.time()
-    for f in fills:
-        side = f.get("side", "yes")
-        action = f.get("action")  # buy | sell
-        # Prices/fees now come as *_dollars floats (0.87 == 87c); count may be a
-        # fixed-point string ("8.00"). Parse defensively so one odd fill can't
-        # crash reconciliation.
-        try:
-            count = int(float(f.get("count") or 0))
-        except (TypeError, ValueError):
-            continue
-        if side == "yes":
-            price = _cents_field(f, "yes_price_dollars", "yes_price")
-        else:
-            npx = _cents_field(f, "no_price_dollars", "no_price")
-            price = (100 - npx) if npx is not None else None
-        if price is None or count <= 0:
-            continue
-        fee_total += _cents_field(f, "fee_dollars", "fee") or 0
-        signed = count if action == "buy" else -count
-        # Only track net YES exposure for this simple single-market strategy.
-        if side == "no":
-            signed = -signed  # a NO buy is economically short YES
-        net += signed
-        cost += signed * price
-
-    if net == 0:
-        log_kv(logger, logging.INFO, "reconciled flat", ticker=ticker, fills=len(fills))
+    try:
+        positions = client.get_positions(ticker=ticker)
+    except Exception as exc:
+        log_kv(logger, logging.WARNING, "positions fetch failed",
+               ticker=ticker, error=str(exc))
         return None
 
-    avg_entry = int(round(cost / net)) if net else 0
-    log_kv(logger, logging.INFO, "reconciled position",
-           ticker=ticker, net=net, avg_entry=avg_entry, fills=len(fills))
-    return Position(
-        ticker=ticker, contracts=abs(net), entry_price_cents=avg_entry,
-        entry_fee_cents=fee_total, opened_ts=opened_ts, remaining=abs(net),
-    )
+    for p in positions:
+        if p.get("ticker") != ticker:
+            continue
+        try:
+            net = int(round(float(p.get("position_fp") or 0)))
+        except (TypeError, ValueError):
+            net = 0
+        if net == 0:
+            break
+        try:
+            exposure = float(p.get("market_exposure_dollars")
+                             or p.get("total_traded_dollars") or 0)
+        except (TypeError, ValueError):
+            exposure = 0.0
+        avg_entry = int(round(exposure / abs(net) * 100)) if net else 0  # cents/contract
+        fees = _cents_field(p, "fees_paid_dollars", "fees_paid") or 0
+        log_kv(logger, logging.INFO, "reconciled position",
+               ticker=ticker, net=net, avg_entry=avg_entry)
+        return Position(
+            ticker=ticker, contracts=abs(net), entry_price_cents=avg_entry,
+            entry_fee_cents=fees, opened_ts=time.time(), remaining=abs(net),
+        )
+
+    log_kv(logger, logging.INFO, "reconciled flat", ticker=ticker)
+    return None
+
+
+def settlement_to_trade(run_id: str, s: dict) -> Optional[dict]:
+    """Convert a Kalshi settlement (expiry outcome) into a kalshi_trades row
+    (cents ints), or None if unparseable. Realized P&L = revenue - cost - fee.
+
+    Fields (from the live shape): ``revenue`` cents received, ``*_total_cost_dollars``
+    the entry cost, ``fee_cost`` dollars, ``*_count_fp`` contracts, ``market_result``
+    'yes'/'no', ``settled_time`` ISO. A win pays 100c/contract, a loss 0.
+    """
+    ticker = s.get("ticker")
+    settled_time = s.get("settled_time")
+    if not ticker or not settled_time:
+        return None
+
+    def _f(k):
+        try:
+            return float(s.get(k) or 0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    contracts = int(round(_f("yes_count_fp") + _f("no_count_fp")))
+    revenue_cents = _cents_field(s, "revenue_dollars", "revenue")
+    if contracts <= 0 or revenue_cents is None:
+        return None
+
+    cost = _f("yes_total_cost_dollars") + _f("no_total_cost_dollars")  # dollars
+    fee = _f("fee_cost")
+    revenue = revenue_cents / 100.0
+    entry_price = int(round(cost / contracts * 100)) if contracts else 0
+    exit_price = 100 if s.get("market_result") == "yes" else 0
+    return {
+        "run_id": run_id, "ticker": ticker, "reason": "settled",
+        "contracts": contracts, "entry_price": entry_price, "exit_price": exit_price,
+        "entry_fee": int(round(fee * 100)), "exit_fee": 0,
+        "gross_pnl": int(round((revenue - cost) * 100)),
+        "net_pnl": int(round((revenue - cost - fee) * 100)),
+        "notional": entry_price * contracts, "hold_secs": 0,
+        "closed_at": settled_time, "settle_key": f"{ticker}:{settled_time}",
+    }
+
+
+def capture_settlements(client: KalshiClient, sink, run_id: str,
+                        logger: logging.Logger, seen: set) -> None:
+    """Record any newly-settled markets as closed trades. Idempotent: the DB
+    upsert on settle_key means a restart (which resets ``seen``) won't dup."""
+    try:
+        settlements = client.get_settlements(limit=50)
+    except Exception as exc:
+        log_kv(logger, logging.WARNING, "settlements fetch failed", error=str(exc))
+        return
+    for s in settlements:
+        key = f"{s.get('ticker')}:{s.get('settled_time')}"
+        if key in seen:
+            continue
+        seen.add(key)
+        if sink:
+            sink.record_settlement(run_id, s)
+        log_kv(logger, logging.INFO, "settlement recorded",
+               ticker=s.get("ticker"), result=s.get("market_result"),
+               revenue_cents=_cents_field(s, "revenue_dollars", "revenue"))
 
 
 # --------------------------------------------------------------------------- #
@@ -1581,6 +1657,10 @@ def run_manage(cfg: Config, client: KalshiClient, signer: KalshiSigner,
         mem.refresh(time.time())   # prime performance history before trading
     if controls is not None:
         controls.refresh(time.time())   # apply dashboard settings before trading
+    settle_seen: set = set()       # settlement dedup within this run
+    last_settle_check = 0.0
+    if sink and signer.ready:       # backfill any settlements from before startup
+        capture_settlements(client, sink, run_id, logger, settle_seen)
     i = 0
     try:
         while cycles is None or i < cycles:
@@ -1646,6 +1726,12 @@ def run_manage(cfg: Config, client: KalshiClient, signer: KalshiSigner,
                 controls.maybe_refresh(now)
             if mem is not None:
                 mem.maybe_refresh(now)
+            # Mirror settled markets (expiry wins/losses) to the dashboard as
+            # closed trades with real P&L -- catches positions that settle at
+            # expiry, not just bot-initiated sells.
+            if sink and signer.ready and (now - last_settle_check) >= 60:
+                last_settle_check = now
+                capture_settlements(client, sink, run_id, logger, settle_seen)
             hist = mem.snapshot_block() if mem is not None else None
             placed = False
 

@@ -175,51 +175,53 @@ def _test_manage_dryrun(chk):
 
 
 def _test_reconcile(chk, cfg):
-    class _StubClient:
-        def get_fills(self, ticker=None, limit=200):
-            return [
-                {"side": "yes", "action": "buy", "count": 100, "yes_price": 87, "fee": 8},
-                {"side": "yes", "action": "buy", "count": 50, "yes_price": 89, "fee": 4},
-                {"side": "yes", "action": "sell", "count": 30, "yes_price": 95, "fee": 3},
-            ]
-    pos = bot.reconcile_position_from_fills(_StubClient(), "T", logging.getLogger("t"))
+    # Reconcile now reads the authoritative /portfolio/positions endpoint.
+    class _PosClient:
+        def get_positions(self, ticker=None):
+            return [{"ticker": "T", "position_fp": "8.00",
+                     "market_exposure_dollars": "7.120000",
+                     "fees_paid_dollars": "0.054900"}]
+    pos = bot.reconcile_position_from_fills(_PosClient(), "T", logging.getLogger("t"))
     chk.ok("reconcile non-null", pos is not None)
-    # net = 100 + 50 - 30 = 120
-    chk.eq("reconcile net contracts", pos.contracts, 120)
-    # cost = 100*87 + 50*89 - 30*95 = 8700 + 4450 - 2850 = 10300; avg = 10300/120 = 85.8 -> 86
-    chk.eq("reconcile avg entry", pos.entry_price_cents, 86)
+    chk.eq("reconcile net contracts", pos.contracts, 8)
+    chk.eq("reconcile avg entry", pos.entry_price_cents, 89)   # 7.12/8 = 0.89 -> 89
+    chk.eq("reconcile fees", pos.entry_fee_cents, 5)           # 0.0549 -> 5c
 
     class _FlatClient:
-        def get_fills(self, ticker=None, limit=200):
-            return [
-                {"side": "yes", "action": "buy", "count": 10, "yes_price": 87, "fee": 1},
-                {"side": "yes", "action": "sell", "count": 10, "yes_price": 90, "fee": 1},
-            ]
+        def get_positions(self, ticker=None):
+            return []   # no open position -> flat
     chk.ok("reconcile flat -> None",
            bot.reconcile_position_from_fills(_FlatClient(), "T", logging.getLogger("t")) is None)
 
-    # V2 fills: prices as *_dollars floats, count as a fixed-point string.
-    class _V2Client:
-        def get_fills(self, ticker=None, limit=200):
-            return [
-                {"side": "yes", "action": "buy", "count": "8.00",
-                 "yes_price_dollars": 0.90, "fee_dollars": 0.02},
-                {"side": "yes", "action": "buy", "count": "2.00",
-                 "yes_price_dollars": 0.88, "fee_dollars": 0.01},
-            ]
-    v2 = bot.reconcile_position_from_fills(_V2Client(), "T", logging.getLogger("t"))
-    chk.eq("V2 dollar fills net", v2.contracts, 10)
-    chk.eq("V2 dollar fills avg entry", v2.entry_price_cents, 90)  # 896/10 -> 90
+    class _ZeroClient:
+        def get_positions(self, ticker=None):
+            return [{"ticker": "T", "position_fp": "0.00", "market_exposure_dollars": "0"}]
+    chk.ok("zero position -> None",
+           bot.reconcile_position_from_fills(_ZeroClient(), "T", logging.getLogger("t")) is None)
 
-    # A fill with no parseable price is skipped, not fatal (the old int(None) crash).
-    class _BadFill:
-        def get_fills(self, ticker=None, limit=200):
-            return [
-                {"side": "yes", "action": "buy", "count": "5", "yes_price_dollars": 0.87},
-                {"side": "yes", "action": "buy", "count": "3", "yes_price": None, "no_price": None},
-            ]
-    bad = bot.reconcile_position_from_fills(_BadFill(), "T", logging.getLogger("t"))
-    chk.eq("unparseable fill skipped, good one kept", bad.contracts, 5)
+
+def _test_settlement(chk):
+    # The exact settlement shape from the live account dump.
+    s = {
+        "ticker": "KXBTCD-26JUL1318-T61799.99", "market_result": "yes",
+        "revenue": 900, "value": 100,
+        "yes_count_fp": "9.00", "yes_total_cost_dollars": "7.740000",
+        "no_count_fp": "0.00", "no_total_cost_dollars": "0.000000",
+        "fee_cost": "0.008500", "settled_time": "2026-07-13T22:05:19Z",
+    }
+    row = bot.settlement_to_trade("run-1", s)
+    chk.eq("settlement contracts", row["contracts"], 9)
+    chk.eq("settlement reason", row["reason"], "settled")
+    chk.eq("settlement entry price", row["entry_price"], 86)     # 7.74/9 -> 86c
+    chk.eq("settlement exit price (yes win)", row["exit_price"], 100)
+    chk.eq("settlement net pnl cents", row["net_pnl"], 125)      # +$1.25 (matches the real trade)
+    chk.eq("settlement dedup key", row["settle_key"],
+           "KXBTCD-26JUL1318-T61799.99:2026-07-13T22:05:19Z")
+
+    loss = bot.settlement_to_trade("r", {**s, "market_result": "no", "revenue": 0})
+    chk.eq("losing settlement pays 0", loss["exit_price"], 0)
+    chk.ok("losing settlement is negative", loss["net_pnl"] < 0)
+    chk.ok("empty settlement -> None", bot.settlement_to_trade("r", {}) is None)
 
 
 def _test_paper_harness(chk, cfg):
@@ -871,6 +873,7 @@ def run_selftests(cfg=None, logger=None) -> int:
     _test_sign_strips_query(chk)
     _test_pem_normalize(chk)
     _test_reconcile(chk, cfg)
+    _test_settlement(chk)
     _test_paper_harness(chk, cfg)
     _test_signing(chk)
     print(f"\n{chk.passed} passed, {chk.failed} failed")
